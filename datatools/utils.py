@@ -13,7 +13,7 @@ from tqdm import tqdm
 from datatools import config
 
 
-def is_home_on_left(period_tracking: pd.DataFrame):
+def detect_keepers(period_tracking: pd.DataFrame):
     home_x_cols = [c for c in period_tracking.columns if re.match(r"home_.*_x", c)]
     away_x_cols = [c for c in period_tracking.columns if re.match(r"away_.*_x", c)]
 
@@ -23,7 +23,7 @@ def is_home_on_left(period_tracking: pd.DataFrame):
     home_gk_x = period_tracking[f"{home_gk}_x"].mean()
     away_gk_x = period_tracking[f"{away_gk}_x"].mean()
 
-    return home_gk_x < away_gk_x
+    return (home_gk, away_gk) if home_gk_x < away_gk_x else (away_gk, home_gk)
 
 
 def find_active_players(traces: pd.DataFrame, frame: int = None, team: str = None, include_goals=False) -> dict:
@@ -64,8 +64,9 @@ def label_frames_and_episodes(
         n_prev_frames = 0
 
         for i in tracking["period_id"].unique():
-            period_tracking = tracking[tracking["period_id"] == i].copy()
-            n_prev_frames += period_tracking["frame_id"].max() + 1
+            period_tracking = tracking[tracking["period_id"] == i]
+            tracking.loc[period_tracking.index, "frame_id"] += n_prev_frames
+            n_prev_frames += len(period_tracking)
 
     tracking["episode_id"] = 0
     n_prev_episodes = 0
@@ -94,7 +95,25 @@ def label_frames_and_episodes(
     return tracking.reset_index(), events
 
 
+def label_phases(tracking: pd.DataFrame) -> pd.DataFrame:
+    phases = summarize_phases(tracking)
+
+    tracking = tracking.copy()
+    tracking["phase_id"] = 0
+
+    for i in phases.index:
+        start_frame = phases.at[i, "start_frame_id"]
+        end_frame = phases.at[i, "end_frame_id"]
+        phase_mask = tracking["frame_id"].between(start_frame, end_frame)
+        tracking.loc[phase_mask, "phase_id"] = i
+
+    return tracking
+
+
 def summarize_playing_times(tracking: pd.DataFrame) -> pd.DataFrame:
+    if "frame_id" in tracking.columns:
+        tracking = tracking.copy().set_index("frame_id")
+
     players = [c[:-2] for c in tracking.columns if c[:4] in ["home", "away"] and c.endswith("_x")]
     play_records = dict()
 
@@ -107,10 +126,10 @@ def summarize_playing_times(tracking: pd.DataFrame) -> pd.DataFrame:
 
 
 def summarize_phases(tracking: pd.DataFrame, keepers: List[str] = None) -> pd.DataFrame:
-    if keepers is None:
-        keepers = []
-    else:
-        keepers = list(keepers)
+    if "frame_id" in tracking:
+        tracking = tracking.copy().set_index("frame_id")
+
+    keepers = [] if keepers is None else list(keepers)
 
     play_records = summarize_playing_times(tracking)
     player_in_frames = play_records["in_frame_id"].unique().tolist()
@@ -124,7 +143,7 @@ def summarize_phases(tracking: pd.DataFrame, keepers: List[str] = None) -> pd.Da
         end_frame = phase_changes[i + 1] - 1
 
         alive_tracking = tracking[tracking["ball_state"] == "alive"].loc[start_frame:end_frame].copy()
-        if alive_tracking.empty:
+        if len(alive_tracking) < 250:
             continue
 
         active_players = find_active_players(alive_tracking)
@@ -136,39 +155,45 @@ def summarize_phases(tracking: pd.DataFrame, keepers: List[str] = None) -> pd.Da
         away_keeper = away_keepers[0] if away_keepers else alive_tracking[away_x_cols].mean().idxmax()[:-2]
 
         phase_dict = {
-            "phase_id": i + 1,
             "period_id": alive_tracking["period_id"].iloc[0],
-            "start_frame": start_frame,
-            "end_frame": end_frame,
+            "start_frame_id": start_frame,
+            "end_frame_id": end_frame,
             "active_players": active_players[0] + active_players[1],
             "active_keepers": [home_keeper, away_keeper],
         }
         phases.append(phase_dict)
 
-    phases = pd.DataFrame(phases).set_index("phase_id")
+    phases = pd.DataFrame(phases)
+    phases.index.name = "phase"
+    phases.index += 1
+
     return phases
 
 
-def calc_physical_features(tracking: pd.DataFrame, fps=25) -> pd.DataFrame:
+def calculate_running_features(tracking: pd.DataFrame, fps=25) -> pd.DataFrame:
     from scipy.signal import savgol_filter
+
+    tracking = tracking.copy()
 
     if "episode_id" not in tracking.columns:
         tracking = label_frames_and_episodes(tracking)
-    else:
-        tracking = tracking.copy()
+
+    if "phase_id" not in tracking.columns:
+        tracking = label_phases(tracking)
 
     home_players = [c[:-2] for c in tracking.dropna(axis=1, how="all").columns if re.match(r"home_.*_x", c)]
     away_players = [c[:-2] for c in tracking.dropna(axis=1, how="all").columns if re.match(r"away_.*_x", c)]
     objects = home_players + away_players + ["ball"]
     physical_features = ["x", "y", "vx", "vy", "speed", "accel"]
 
-    state_cols = ["period_id", "timestamp", "episode_id", "ball_state", "ball_owning_team_id"]
+    state_cols = ["frame_id", "period_id", "timestamp", "phase_id", "episode_id", "ball_state", "ball_owning_team_id"]
     feature_cols = [f"{p}_{f}" for p in objects for f in physical_features] + ["ball_z"]
+
     if "player_id" in tracking.columns:
         state_cols.append("player_id")
 
-    for p in tqdm(objects, desc="Calculating physical features per player"):
-        new_cols = [f"{p}_{f}" for f in physical_features[2:]]
+    for p in tqdm(objects, desc="Calculating running features per player"):
+        new_cols = [f"{p}_{x}" for x in physical_features[2:]]
         new_features = pd.DataFrame(np.nan, index=tracking.index, columns=new_cols)
 
         # Drop pre-existing columns to avoid duplicate column names during concat/assign

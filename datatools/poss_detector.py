@@ -289,7 +289,7 @@ if __name__ == "__main__":
 
         detector = PossDetector(events, tracking)
         touches = detector.detect_touches()
-        tracking_poss = detector.merge_tracking_poss(touches)
-        tracking_processed = utils.calc_physical_features(tracking_poss)
+        tracking = detector.merge_tracking_poss(touches)
 
-        tracking_poss.to_parquet(f"{OUTPUT_DIR}/{match_id}.parquet")
+        tracking_processed = utils.calculate_running_features(tracking)
+        tracking_processed.to_parquet(f"{OUTPUT_DIR}/{match_id}.parquet")
