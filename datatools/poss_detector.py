@@ -1,54 +1,27 @@
 import os
 import re
+import sys
 from typing import List, Tuple
+
+if not os.getcwd() in sys.path:
+    sys.path.append(os.getcwd())
 
 import numpy as np
 import pandas as pd
 from rdp import rdp
 from tqdm import tqdm
 
-PITCH_X, PITCH_Y = 105, 68
-RDP_FRAME_SCALE = 1e-6
-RDP_MIN_ANGLE = 15.0
-MAX_DIST = 5.0
+from datatools import config, utils
 
 
 class PossDetector:
     def __init__(self, events: pd.DataFrame, tracking: pd.DataFrame):
-        self.events, self.tracking = PossDetector.label_episodes(events, tracking)
+        self.tracking, self.events = utils.label_frames_and_episodes(tracking, events)
         self.atomic_events = PossDetector.get_atomic_events(self.events, self.tracking)
 
         self.home_players = [c[:-2] for c in tracking.columns if re.match(r"home_\d+_x", c)]
         self.away_players = [c[:-2] for c in tracking.columns if re.match(r"away_\d+_x", c)]
         self.team_players = {"home": self.home_players, "away": self.away_players}
-
-    @staticmethod
-    def label_episodes(events: pd.DataFrame, tracking: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        events = events.copy()
-        tracking = tracking.copy()
-
-        tracking["episode_id"] = 0
-        n_prev_episodes = 0
-
-        for i in tracking["period_id"].unique():
-            period_tracking = tracking[tracking["period_id"] == i].copy()
-            alive_tracking = period_tracking[period_tracking["ball_state"] == "alive"].copy()
-
-            frame_diffs = np.diff(alive_tracking["frame_id"].values, prepend=-5)
-            period_episode_ids = (frame_diffs >= 5).astype(int).cumsum() + n_prev_episodes
-            tracking.loc[alive_tracking.index, "episode_id"] = period_episode_ids
-
-            n_prev_episodes = period_episode_ids.max()
-
-        tracking = tracking.set_index("frame_id")
-        events["episode_id"] = np.nan
-
-        for i in events.index:
-            frame_id = events.at[i, "frame_id"]
-            if not pd.isna(frame_id):
-                events.at[i, "episode_id"] = tracking.at[frame_id, "episode_id"]
-
-        return events, tracking.reset_index()
 
     @staticmethod
     def get_atomic_events(events: pd.DataFrame, tracking: pd.DataFrame) -> pd.DataFrame:
@@ -147,7 +120,11 @@ class PossDetector:
         return df.sort_values("rdp_idx", ignore_index=True)
 
     @staticmethod
-    def simplify_trajectory(xy: pd.DataFrame, frame_scale=RDP_FRAME_SCALE, min_angle=RDP_MIN_ANGLE) -> np.ndarray:
+    def simplify_trajectory(
+        xy: pd.DataFrame,
+        frame_scale=config.RDP_FRAME_SCALE,
+        min_angle=config.RDP_MIN_ANGLE,
+    ) -> np.ndarray:
         fxy = xy.reset_index().copy()  # Columns: [frame_id, ball_x, ball_y]
         fxy["frame_id"] *= frame_scale  # To eliminate the influence of frame_id in RDP
         rdp_points = np.array(rdp(fxy, epsilon=0.5))
@@ -168,7 +145,12 @@ class PossDetector:
 
         return rdp_points
 
-    def detect_touches_episode(self, episode: int, rdp_min_angle=RDP_MIN_ANGLE, max_dist=MAX_DIST) -> pd.DataFrame:
+    def detect_touches_episode(
+        self,
+        episode: int,
+        rdp_min_angle=config.RDP_MIN_ANGLE,
+        max_dist=config.POSS_MAX_DIST,
+    ) -> pd.DataFrame:
         ep_tracking = self.tracking[self.tracking["episode_id"] == episode].copy().set_index("frame_id")
         ep_events = self.atomic_events[self.atomic_events["episode_id"] == episode]
 
@@ -228,15 +210,10 @@ class PossDetector:
 
         return touches
 
-    def detect_touches(self, rdp_min_angle=RDP_MIN_ANGLE, max_dist=MAX_DIST, tqdm_desc: str = None) -> pd.DataFrame:
+    def detect_touches(self, rdp_min_angle=config.RDP_MIN_ANGLE, max_dist=config.POSS_MAX_DIST) -> pd.DataFrame:
         touches: List[pd.DataFrame] = []
 
-        if tqdm_desc is None:
-            iterator = tqdm(self.tracking["episode_id"].unique())
-        else:
-            iterator = tqdm(self.tracking["episode_id"].unique(), desc=tqdm_desc)
-
-        for episode in iterator:
+        for episode in tqdm(self.tracking["episode_id"].unique(), desc="Detecting touches per episode"):
             if episode == 0:
                 continue
 
@@ -254,11 +231,11 @@ class PossDetector:
         touches.loc[goal_mask, "spadl_type"] = "goal"
 
         out_l = out_mask & (touches["x"] < 0)
-        out_r = out_mask & (touches["x"] > PITCH_X)
+        out_r = out_mask & (touches["x"] > config.PITCH_X)
         out_b = out_mask & (touches["y"] < 0)
-        out_t = out_mask & (touches["y"] > PITCH_Y)
+        out_t = out_mask & (touches["y"] > config.PITCH_Y)
         goal_l = goal_mask & (touches["x"] < 5)
-        goal_r = goal_mask & (touches["x"] > PITCH_X - 5)
+        goal_r = goal_mask & (touches["x"] > config.PITCH_X - 5)
 
         touches.loc[out_l, "player_id"] = "out_left"
         touches.loc[out_r, "player_id"] = "out_right"
@@ -295,19 +272,24 @@ class PossDetector:
 
 
 if __name__ == "__main__":
-    EVENT_PATH = "data/sportec/event_synced"
+    EVENT_DIR = "data/sportec/event_synced"
     TRACKING_DIR = "data/sportec/tracking_parquet"
-    OUTPUT_DIR = "data/sportec/tracking_poss"
+    OUTPUT_DIR = "data/sportec/tracking_processed"
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    match_ids = [f.split(".")[0] for f in os.listdir(EVENT_PATH)]
+    match_ids = [f.split(".")[0] for f in os.listdir(EVENT_DIR)]
 
     for match_id in match_ids:
-        events = pd.read_parquet(f"{EVENT_PATH}/{match_id}.parquet")
+        print()
+        print(match_id)
+
+        events = pd.read_parquet(f"{EVENT_DIR}/{match_id}.parquet")
         tracking = pd.read_parquet(f"{TRACKING_DIR}/{match_id}.parquet")
+        tracking[["timestamp", "ball_x", "ball_y"]] = tracking[["timestamp", "ball_x", "ball_y"]].round(2)
 
         detector = PossDetector(events, tracking)
-        touches = detector.detect_touches(tqdm_desc=match_id)
+        touches = detector.detect_touches()
         tracking_poss = detector.merge_tracking_poss(touches)
+        tracking_processed = utils.calc_physical_features(tracking_poss)
 
         tracking_poss.to_parquet(f"{OUTPUT_DIR}/{match_id}.parquet")
