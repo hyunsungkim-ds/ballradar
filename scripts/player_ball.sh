@@ -1,5 +1,5 @@
 python train.py \
---trial 0 \
+--trial 1 \
 --model player_ball \
 --macro_type player_poss \
 --target_type ball \
@@ -8,6 +8,7 @@ python train.py \
 --flip_pitch \
 --macro_weight 20 \
 --rloss_weight 1 \
+--l1_weight 0.0001 \
 --bidirectional \
 --macro_ppe \
 --macro_fpe \

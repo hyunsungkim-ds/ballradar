@@ -7,23 +7,17 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 
 from dataset import SoccerDataset
 from models import load_model
-from models.player_ball import PlayerBall
 from models.utils import (
     calc_class_acc,
     calc_real_loss,
     calc_speed,
     calc_trace_dist,
+    l1_regularizer,
     num_trainable_params,
 )
-
-# DataParallel still wraps forwards with torch.cuda.amp.autocast, which is deprecated in newer PyTorch releases.
-# Alias it to the recommended API to avoid the noisy FutureWarning while keeping behavior the same.
-if hasattr(torch, "amp") and hasattr(torch.cuda, "amp"):
-    torch.cuda.amp.autocast = lambda *args, **kwargs: torch.amp.autocast("cuda", *args, **kwargs)
 
 
 # Helper functions
@@ -61,10 +55,7 @@ def run_epoch(model: nn.DataParallel, optimizer: torch.optim.Adam, train=False, 
         loss_dict = {"ce_loss": [], "accuracy": []}
 
     elif model.module.model_type == "regressor":
-        if "rloss_weight" in model.module.params and model.module.params["rloss_weight"] > 0:
-            loss_dict = {"mse_loss": [], "real_loss": [], "pos_error": []}
-        else:
-            loss_dict = {"mse_loss": [], "pos_error": []}
+        loss_dict = {"mse_loss": [], "pos_error": []}
 
     elif model.module.model_type == "generator":
         loss_dict = {"kld_loss": [], "recon_loss": [], "pos_error": []}
@@ -73,10 +64,13 @@ def run_epoch(model: nn.DataParallel, optimizer: torch.optim.Adam, train=False, 
         loss_dict = {"macro_ce_loss": [], "micro_ce_loss": [], "macro_acc": [], "micro_acc": []}
 
     elif model.module.model_type == "macro_regressor":
-        if "rloss_weight" in model.module.params and model.module.params["rloss_weight"] > 0:
-            loss_dict = {"ce_loss": [], "mse_loss": [], "real_loss": [], "accuracy": [], "pos_error": []}
-        else:
-            loss_dict = {"ce_loss": [], "mse_loss": [], "accuracy": [], "pos_error": []}
+        loss_dict = {"ce_loss": [], "mse_loss": [], "accuracy": [], "pos_error": []}
+
+    if model.module.params.get("rloss_weight") > 0:
+        loss_dict["real_loss"] = []
+
+    if train and model.module.params.get("l1_weight") > 0:
+        loss_dict["l1_loss"] = []
 
     for batch_idx, data in enumerate(loader):
         if model.module.model_type == "classifier":
@@ -110,12 +104,12 @@ def run_epoch(model: nn.DataParallel, optimizer: torch.optim.Adam, train=False, 
             loss_dict["mse_loss"] += [loss.item()]
 
             n_features = model.module.params["n_features"]
-            real_loss = calc_real_loss(out[:, :, 0:2], input, n_features)
-            if "rloss_weight" in model.module.params and model.module.params["rloss_weight"] > 0:
+            rloss_weight = model.module.params.get("rloss_weight")
+
+            if rloss_weight > 0:
+                real_loss = calc_real_loss(out[:, :, 0:2], input, n_features)
+                loss += real_loss * rloss_weight
                 loss_dict["real_loss"] += [real_loss.item()]
-                rloss_weight = model.module.params["rloss_weight"]
-                if rloss_weight > 0:
-                    loss += real_loss * rloss_weight
 
             if model.module.target_type == "gk":
                 team1_pos_error = calc_trace_dist(out[:, :, 0:2], target[:, :, 0:2])
@@ -192,14 +186,12 @@ def run_epoch(model: nn.DataParallel, optimizer: torch.optim.Adam, train=False, 
                 real_loss = calc_real_loss(micro_out[:, :, 0:2], input, n_features)
 
                 loss = macro_loss + micro_loss
-                if "rloss_weight" in model.module.params and model.module.params["rloss_weight"] > 0:
-                    rloss_weight = model.module.params["rloss_weight"]
-                    if rloss_weight > 0:
-                        loss += real_loss * rloss_weight
-
                 loss_dict["ce_loss"] += [macro_loss.item()]
                 loss_dict["mse_loss"] += [micro_loss.item()]
-                if "rloss_weight" in model.module.params and model.module.params["rloss_weight"] > 0:
+
+                rloss_weight = model.module.params.get("rloss_weight")
+                if rloss_weight > 0:
+                    loss += real_loss * rloss_weight
                     loss_dict["real_loss"] += [real_loss.item()]
 
                 loss_dict["accuracy"] += [calc_class_acc(macro_out, macro_target)]
@@ -209,6 +201,11 @@ def run_epoch(model: nn.DataParallel, optimizer: torch.optim.Adam, train=False, 
                     loss_dict["pos_error"] += [(team1_pos_error + team2_pos_error) / 2]
                 else:
                     loss_dict["pos_error"] += [calc_trace_dist(micro_out[:, :, 0:2], micro_target[:, :, 0:2])]
+
+        if train and args.l1_weight > 0:
+            l1_loss = l1_regularizer(model.module)
+            loss += args.l1_weight * l1_loss
+            loss_dict["l1_loss"] += [(args.l1_weight * l1_loss).item()]
 
         if train:
             optimizer.zero_grad()
@@ -240,6 +237,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--macro_weight", type=float, required=False, default=20, help="Weight for the macro loss")
     parser.add_argument("--rloss_weight", type=float, required=False, default=0, help="Weight for the reality loss")
+    parser.add_argument("--l1_weight", type=float, required=False, default=0, help="Weight for the L1 loss")
     parser.add_argument("--kld_weight", type=float, required=False, default=1, help="Weight for the KLD loss in VRNN")
     parser.add_argument("--speed_loss", action="store_true", default=False, help="Include speed loss in MSE")
     parser.add_argument("--masking", type=float, required=False, default=1, help="Masking proportion of the target")
@@ -293,16 +291,6 @@ if __name__ == "__main__":
     if args.cont:
         state_dict = torch.load("{}/model/{}_state_dict_best_pe.pt".format(save_path, args.model))
         model.module.load_state_dict(state_dict)
-    else:
-        print_keys = ["flip_pitch", "n_features", "batch_size", "start_lr"]
-        if args.model in ["team_ball", "player_ball"]:
-            print_keys += ["macro_weight"]
-        if "rloss_weight" in args_dict and args_dict["rloss_weight"] > 0:
-            print_keys += ["rloss_weight"]
-        if "speed_loss" in args_dict and args_dict["speed_loss"]:
-            print_keys += ["speed_loss"]
-        if "masking" in args_dict:
-            print_keys += ["masking"]
 
     data_dir = "data/sportec/tracking_processed"
     data_paths = [f"{data_dir}/{f}" for f in os.listdir(data_dir)]
@@ -312,27 +300,18 @@ if __name__ == "__main__":
     valid_paths = data_paths[5:6]
 
     print("Generating datasets...")
-    train_dataset = SoccerDataset(
-        data_paths=train_paths,
-        macro_type=args.macro_type,
-        target_type=args.target_type,
-        n_features=args.n_features,
-        window_seconds=args.window_seconds,
-        window_stride=args.window_stride,
-        target_speed=args.speed_loss,
-        flip_pitch=args.flip_pitch,
-    )
-    test_dataset = SoccerDataset(
-        data_paths=valid_paths,
-        macro_type=args.macro_type,
-        target_type=args.target_type,
-        n_features=args.n_features,
-        window_seconds=args.window_seconds,
-        window_stride=args.window_stride,
-        target_speed=args.speed_loss,
-        flip_pitch=args.flip_pitch,
-    )
+    dataset_args = {
+        "macro_type": args.macro_type,
+        "target_type": args.target_type,
+        "n_features": args.n_features,
+        "window_seconds": args.window_seconds,
+        "window_stride": args.window_stride,
+        "target_speed": args.speed_loss,
+        "flip_pitch": args.flip_pitch,
+    }
     nw = len(model.device_ids) * 4
+    train_dataset = SoccerDataset(train_paths, **dataset_args)
+    test_dataset = SoccerDataset(valid_paths, **dataset_args)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=nw, pin_memory=True)
     valid_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=True, num_workers=nw, pin_memory=True)
 
@@ -344,7 +323,6 @@ if __name__ == "__main__":
 
     for e in range(args.n_epochs):
         epoch = e + 1
-
         hyperparams = {"pretrain": epoch <= args.pretrain_time}
 
         # Set a custom learning rate schedule

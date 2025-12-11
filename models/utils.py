@@ -61,6 +61,14 @@ def get_macro_ohe(macro, n_agents, M, device="cuda"):
     return macro_ohe
 
 
+def l1_regularizer(model):
+    l1_loss = 0
+    for model_param_name, model_param_value in model.named_parameters():
+        if model_param_name.endswith("weight"):
+            l1_loss += model_param_value.abs().sum()
+    return l1_loss
+
+
 def sample_gauss(mean, std, device="cuda"):
     eps = torch.FloatTensor(std.size()).normal_().to(device)
     return eps.mul(std).add_(mean)
