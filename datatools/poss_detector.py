@@ -226,16 +226,19 @@ class PossDetector:
 
         out_mask = touches["player_id"] == "out"
         goal_mask = touches["player_id"] == "goal"
-
         touches.loc[out_mask, "spadl_type"] = "out"
         touches.loc[goal_mask, "spadl_type"] = "goal"
 
-        out_l = out_mask & (touches["x"] < 0)
-        out_r = out_mask & (touches["x"] > config.PITCH_X)
-        out_b = out_mask & (touches["y"] < 0)
-        out_t = out_mask & (touches["y"] > config.PITCH_Y)
-        goal_l = goal_mask & (touches["x"] < 5)
-        goal_r = goal_mask & (touches["x"] > config.PITCH_X - 5)
+        ratio = config.PITCH_Y / config.PITCH_X
+        diag1 = touches["y"] - ratio * touches["x"]
+        diag2 = touches["y"] + ratio * touches["x"] - config.PITCH_Y
+
+        out_l = out_mask & (diag1 > 0) & (diag2 < 0)
+        out_r = out_mask & (diag1 < 0) & (diag2 > 0)
+        out_b = out_mask & (diag1 < 0) & (diag2 < 0)
+        out_t = out_mask & (diag1 > 0) & (diag2 > 0)
+        goal_l = goal_mask & (touches["x"] < 10)
+        goal_r = goal_mask & (touches["x"] > config.PITCH_X - 10)
 
         touches.loc[out_l, "player_id"] = "out_left"
         touches.loc[out_r, "player_id"] = "out_right"
@@ -290,6 +293,10 @@ if __name__ == "__main__":
         detector = PossDetector(events, tracking)
         touches = detector.detect_touches()
         tracking = detector.merge_tracking_poss(touches)
+
+        if "out" in touches["player_id"] or "goal" in touches["player_id"]:
+            unclear_outs = touches[touches["player_id"].isin(["out", "goal"])]
+            print(unclear_outs)
 
         tracking_processed = utils.calculate_running_features(tracking)
         tracking_processed.to_parquet(f"{OUTPUT_DIR}/{match_id}.parquet")
