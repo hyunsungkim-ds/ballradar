@@ -24,6 +24,7 @@ class SoccerDataset(Dataset):
         target_speed: bool = False,
         flip_pitch: bool = False,
     ):
+        self.data_paths = data_paths
         self.macro_type = macro_type
         self.target_type = target_type
         targets = [target_type]  # "gk" will be modified later
@@ -98,15 +99,18 @@ class SoccerDataset(Dataset):
                         ep_macro = (ep_tracking["ball_owning_team_id"] == right_team).astype(int).values
 
                     elif macro_type == "player_poss":
-                        player_poss = ep_tracking["player_id"].bfill().ffill()
-                        ep_macro = player_poss.map(poss_dict).values
+                        ep_macro = ep_tracking["player_id"].bfill().ffill().map(poss_dict).values
+                        if np.isnan(ep_macro).all():
+                            # Skip episodes where player_id is missing for the entire clip
+                            continue
 
                     if target_type == "team_poss":
                         ep_target = (ep_tracking["ball_owning_team_id"] == right_team).astype(int).values
 
                     elif target_type == "player_poss":
-                        player_poss = ep_tracking["player_id"].bfill().ffill()
-                        ep_target = player_poss.map(poss_dict).values
+                        ep_target = ep_tracking["player_id"].bfill().ffill().map(poss_dict).values
+                        if np.isnan(ep_target).all():
+                            continue
 
                     else:  # target_type in ["gk", "ball"]
                         ep_target = ep_tracking[target_cols].values
@@ -241,6 +245,70 @@ class SoccerDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.input_data)
+
+    def build_window_meta(self) -> pd.DataFrame:
+        meta = []
+        idx = 0
+
+        for f in tqdm(self.data_paths):
+            tracking = pd.read_parquet(f)
+            phases = utils.summarize_phases(tracking)
+
+            for phase, row in phases.iterrows():
+                active_players = row["active_players"]
+                if len(active_players) < 22:
+                    continue
+
+                left_gk, right_gk = utils.detect_keepers(tracking[tracking["phase_id"] == phase])
+                targets = [left_gk, right_gk] if self.target_type == "gk" else [self.target_type]
+
+                player_cols = [f"{p}{x}" for p in active_players for x in self.feature_types]
+                input_cols = [c for c in player_cols if c.split("_")[0] not in targets]
+
+                if self.macro_type == "player_poss" or self.target_type == "player_poss":
+                    outside_xy = ["out_left", "out_right", "out_bottom", "out_top"]
+                    input_cols += [f"{k}{x}" for k in outside_xy for x in self.feature_types]
+                    object_order = [c.rsplit("_", 1)[0] for c in input_cols[:: self.n_features]]
+                    poss_dict = dict(zip(object_order, np.arange(len(object_order))))
+                    poss_dict["goal_left"] = len(outside_xy) - 4
+                    poss_dict["goal_right"] = len(outside_xy) - 3
+
+                for episode in tracking.loc[tracking["phase_id"] == phase, "episode_id"].unique():
+                    if episode == 0:
+                        continue
+
+                    ep_tracking = tracking[tracking["episode_id"] == episode]
+
+                    if self.macro_type == "player_poss":
+                        ep_macro = ep_tracking["player_id"].bfill().ffill().map(poss_dict)
+                        if ep_macro.isna().all():
+                            continue
+
+                    if self.target_type == "player_poss":
+                        ep_target = ep_tracking["player_id"].bfill().ffill().map(poss_dict)
+                        if ep_target.isna().all():
+                            continue
+
+                    if len(ep_tracking) < self.window_size:
+                        continue
+
+                    for start_idx in range(0, len(ep_tracking) - self.window_size + 1, self.window_stride):
+                        end_idx = start_idx + self.window_size
+                        window_frames = ep_tracking.iloc[start_idx:end_idx]
+                        meta.append(
+                            {
+                                "dataset_idx": idx,
+                                "file": f,
+                                "phase_id": phase,
+                                "episode_id": episode,
+                                "start_in_episode": start_idx,
+                                "start_frame_id": int(window_frames.iloc[0]["frame_id"]),
+                                "end_frame_id": int(window_frames.iloc[-1]["frame_id"]),
+                            }
+                        )
+                        idx += 1
+
+        return pd.DataFrame(meta)
 
 
 if __name__ == "__main__":
