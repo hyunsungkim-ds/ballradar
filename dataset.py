@@ -15,8 +15,8 @@ class SoccerDataset(Dataset):
     def __init__(
         self,
         data_paths: str,
-        target_type: str = "ball",  # Choices: [team_poss, player_poss, gk, ball]
         macro_type: str = "player_poss",  # Choices: [None, team_poss, player_poss]
+        target_type: str = "ball",  # Choices: [team_poss, player_poss, gk, ball]
         n_features: int = 6,
         fps: float = 25.0,
         window_seconds: float = 10.0,

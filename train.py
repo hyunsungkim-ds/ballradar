@@ -17,11 +17,13 @@ from models.utils import (
     calc_real_loss,
     calc_speed,
     calc_trace_dist,
-    get_params_str,
     num_trainable_params,
 )
 
-# Modified from https://github.com/ezhan94/multiagent-programmatic-supervision/blob/master/train.py
+# DataParallel still wraps forwards with torch.cuda.amp.autocast, which is deprecated in newer PyTorch releases.
+# Alias it to the recommended API to avoid the noisy FutureWarning while keeping behavior the same.
+if hasattr(torch, "amp") and hasattr(torch.cuda, "amp"):
+    torch.cuda.amp.autocast = lambda *args, **kwargs: torch.amp.autocast("cuda", *args, **kwargs)
 
 
 # Helper functions
@@ -48,11 +50,11 @@ def hyperparams_str(epoch, hp):
 
 
 # For one epoch
-def run_epoch(model: nn.DataParallel, optimizer: torch.optim.Adam, train=False, print_every=50):
+def run_epoch(model: nn.DataParallel, optimizer: torch.optim.Adam, train=False, print_batch=50):
     # torch.autograd.set_detect_anomaly(True)
     model.train() if train else model.eval()
 
-    loader = train_loader if train else test_loader
+    loader = train_loader if train else valid_loader
     n_batches = len(loader)
 
     if model.module.model_type == "classifier":
@@ -211,10 +213,10 @@ def run_epoch(model: nn.DataParallel, optimizer: torch.optim.Adam, train=False, 
         if train:
             optimizer.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(model.module.parameters(), clip)
+            nn.utils.clip_grad_norm_(model.module.parameters(), args.clip)
             optimizer.step()
 
-        if train and batch_idx % print_every == 0:
+        if train and batch_idx % print_batch == 0:
             print(f"[{batch_idx:>{len(str(n_batches))}d}/{n_batches}]  {loss_str(loss_dict)}")
 
     for key, value in loss_dict.items():
@@ -223,189 +225,116 @@ def run_epoch(model: nn.DataParallel, optimizer: torch.optim.Adam, train=False, 
     return loss_dict
 
 
-# Main starts here
-parser = argparse.ArgumentParser()
-
-parser.add_argument("-t", "--trial", type=int, required=True)
-parser.add_argument("--model", type=str, required=True, default="player_ball")
-parser.add_argument("--macro_type", type=str, required=False, default="team_poss", help="type of macro-intents")
-parser.add_argument("--target_type", type=str, required=False, default="ball", help="gk, ball, or team_poss")
-parser.add_argument("--macro_weight", type=float, required=False, default=20, help="weight for the macro-intent loss")
-parser.add_argument("--rloss_weight", type=float, required=False, default=0, help="weight for the reality loss")
-parser.add_argument("--kld_weight", type=float, required=False, default=1, help="weight for the KLD loss in VRNN")
-parser.add_argument("--speed_loss", action="store_true", default=False, help="include speed loss in MSE")
-parser.add_argument("--masking", type=float, required=False, default=1, help="masking proportion of the target")
-parser.add_argument("--prev_out_aware", action="store_true", default=False, help="make RNN refer to previous outputs")
-parser.add_argument("--bidirectional", action="store_true", default=False, help="make RNN bidirectional")
-
-parser.add_argument("--train_fito", action="store_true", default=False, help="Use Fitogether data for training")
-parser.add_argument("--valid_fito", action="store_true", default=False, help="Use Fitogether data for validation")
-parser.add_argument("--train_metrica", action="store_true", default=False, help="Use Metrica data for training")
-parser.add_argument("--valid_metrica", action="store_true", default=False, help="Use Metrica data for validation")
-parser.add_argument("--flip_pitch", action="store_true", default=False, help="augment data by flipping the pitch")
-parser.add_argument("--n_features", type=int, required=False, default=2, help="num features")
-
-parser.add_argument("--n_epochs", type=int, required=False, default=200, help="num epochs")
-parser.add_argument("--batch_size", type=int, required=False, default=32, help="batch size")
-parser.add_argument("--start_lr", type=float, required=False, default=0.0001, help="starting learning rate")
-parser.add_argument("--min_lr", type=float, required=False, default=0.0001, help="minimum learning rate")
-parser.add_argument("--clip", type=int, required=False, default=10, help="gradient clipping")
-parser.add_argument("--print_every_batch", type=int, required=False, default=50, help="periodically print performance")
-parser.add_argument("--save_every_epoch", type=int, required=False, default=10, help="periodically save model")
-parser.add_argument("--pretrain_time", type=int, required=False, default=0, help="num epochs to train macro policy")
-parser.add_argument("--seed", type=int, required=False, default=128, help="PyTorch random seed")
-parser.add_argument("--cuda", action="store_true", default=False, help="use GPU")
-parser.add_argument("--cont", action="store_true", default=False, help="continue training previous best model")
-parser.add_argument("--best_total_loss", type=float, required=False, default=0, help="best total loss")
-parser.add_argument("--best_pos_error", type=float, required=False, default=0, help="best position error")
-
-args, _ = parser.parse_known_args()
-
-
 if __name__ == "__main__":
-    args.cuda = torch.cuda.is_available()
-    default_device = "cuda:0"
+    parser = argparse.ArgumentParser()
 
-    # Parameters to save
-    params = {
-        "model": args.model,
-        "macro_type": args.macro_type,
-        "target_type": args.target_type,
-        "macro_weight": args.macro_weight,
-        "rloss_weight": args.rloss_weight,
-        "kld_weight": args.kld_weight,
-        "speed_loss": args.speed_loss,
-        "masking": args.masking,
-        "prev_out_aware": args.prev_out_aware,
-        "bidirectional": args.bidirectional,
-        "flip_pitch": args.flip_pitch,
-        "n_features": args.n_features,
-        "batch_size": args.batch_size,
-        "start_lr": args.start_lr,
-        "min_lr": args.min_lr,
-        "seed": args.seed,
-        "cuda": args.cuda,
-        "best_total_loss": args.best_total_loss,
-        "best_pos_error": args.best_pos_error,
-    }
+    parser.add_argument("--trial", type=int, required=True)
+    parser.add_argument("--model", type=str, required=False, default="player_ball")
+    parser.add_argument("--macro_type", type=str, required=False, default="player_poss", help="Type of macro-intents")
+    parser.add_argument("--target_type", type=str, required=False, default="ball", choices=[None, "gk", "ball"])
 
-    # Hyperparameters
-    n_epochs = args.n_epochs
-    batch_size = args.batch_size
-    clip = args.clip
-    print_every = args.print_every_batch
-    save_every = args.save_every_epoch
-    pretrain_time = args.pretrain_time
+    parser.add_argument("--n_features", type=int, required=False, default=2, help="Num features")
+    parser.add_argument("--window_seconds", type=float, required=False, default=10.0, help="Length of a window")
+    parser.add_argument("--window_stride", type=int, required=False, default=5, help="Step size between windows")
+    parser.add_argument("--flip_pitch", action="store_true", default=False, help="Augment data by flipping the pitch")
 
-    # Set manual seed
+    parser.add_argument("--macro_weight", type=float, required=False, default=20, help="Weight for the macro loss")
+    parser.add_argument("--rloss_weight", type=float, required=False, default=0, help="Weight for the reality loss")
+    parser.add_argument("--kld_weight", type=float, required=False, default=1, help="Weight for the KLD loss in VRNN")
+    parser.add_argument("--speed_loss", action="store_true", default=False, help="Include speed loss in MSE")
+    parser.add_argument("--masking", type=float, required=False, default=1, help="Masking proportion of the target")
+    parser.add_argument("--prev_out_aware", action="store_true", default=False, help="Input previous outputs to RNN")
+    parser.add_argument("--bidirectional", action="store_true", default=False, help="Use bidirectional RNNs")
+
+    parser.add_argument("--n_epochs", type=int, required=False, default=200, help="Num epochs")
+    parser.add_argument("--batch_size", type=int, required=False, default=32, help="Batch size")
+    parser.add_argument("--start_lr", type=float, required=False, default=0.0001, help="Initial learning rate")
+    parser.add_argument("--min_lr", type=float, required=False, default=0.0001, help="Minimum learning rate")
+    parser.add_argument("--clip", type=int, required=False, default=10, help="Gradient clipping")
+
+    parser.add_argument("--print_batch", type=int, required=False, default=50, help="Periodically print performance")
+    parser.add_argument("--save_epoch", type=int, required=False, default=10, help="periodically save model")
+    parser.add_argument("--pretrain_time", type=int, required=False, default=0, help="Num epochs to train macro policy")
+    parser.add_argument("--seed", type=int, required=False, default=128, help="PyTorch random seed")
+    parser.add_argument("--cont", action="store_true", default=False, help="Continue training previous best model")
+    parser.add_argument("--best_total_loss", type=float, required=False, default=0, help="Best total loss")
+    parser.add_argument("--best_pos_error", type=float, required=False, default=0, help="Best position error")
+
+    args, _ = parser.parse_known_args()
+    args_dict = vars(args)
+
+    # Set device and manual seed
+    np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    if args.cuda:
+    if torch.cuda.is_available():
+        default_device = "cuda:0"
         torch.cuda.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+    else:
+        default_device = "cpu"
 
     # Load model
-    model = load_model(args.model, params, parser).to(default_device)
+    model = load_model(args.model, args_dict, parser).to(default_device)
     model = nn.DataParallel(model)
 
     # Update params with model parameters
-    params = model.module.params
-    params["total_params"] = num_trainable_params(model)
+    args_dict = model.module.params
+    args_dict["total_params"] = num_trainable_params(model)
 
     # Create save path and saving parameters
-    save_path = "saved/{:03d}".format(args.trial)
+    save_path = "saved/{:02d}".format(args.trial)
     if not os.path.exists(save_path):
         os.makedirs(save_path)
         os.makedirs(save_path + "/model")
-    with open(f"{save_path}/params.json", "w") as f:
-        json.dump(params, f, indent=4)
+    with open(f"{save_path}/args.json", "w") as f:
+        json.dump(args_dict, f, indent=4)
 
-    # Continue a previous experiment, or start a new one
+    # Continue a previous experiment or start a new one
     if args.cont:
         state_dict = torch.load("{}/model/{}_state_dict_best_pe.pt".format(save_path, args.model))
         model.module.load_state_dict(state_dict)
     else:
-        if args.model.endswith("lstm"):  # nonhierarchical models
-            title = f"{args.trial} {args.target_type} | {args.model}"
-        else:  # hierarchical models (team_ball or player_ball)
-            title = f"{args.trial} {args.target_type} | {args.model}"
-        if args.prev_out_aware:
-            title += " | prev_out_aware"
-        if args.bidirectional:
-            title += " | bidirectional"
-
         print_keys = ["flip_pitch", "n_features", "batch_size", "start_lr"]
         if args.model in ["team_ball", "player_ball"]:
             print_keys += ["macro_weight"]
-        if "rloss_weight" in params and params["rloss_weight"] > 0:
+        if "rloss_weight" in args_dict and args_dict["rloss_weight"] > 0:
             print_keys += ["rloss_weight"]
-        if "speed_loss" in params and params["speed_loss"]:
+        if "speed_loss" in args_dict and args_dict["speed_loss"]:
             print_keys += ["speed_loss"]
-        if "masking" in params:
+        if "masking" in args_dict:
             print_keys += ["masking"]
 
-        printlog(title)
-        # printlog(model.module.params_str)
-        printlog(get_params_str(print_keys, model.module.params))
-        printlog("n_params {:,}".format(params["total_params"]))
-    printlog("############################################################")
+    data_dir = "data/sportec/tracking_processed"
+    data_paths = [f"{data_dir}/{f}" for f in os.listdir(data_dir)]
+    data_paths.sort()
 
-    print()
+    train_paths = data_paths[:5]
+    valid_paths = data_paths[5:6]
+
     print("Generating datasets...")
-
-    if args.target_type == "gk":
-        train_files = ["match1.csv", "match2.csv", "match3_valid.csv"]
-        valid_files = ["match3_test.csv"]
-
-        train_paths = [f"data/metrica_traces/{f}" for f in train_files]
-        valid_paths = [f"data/metrica_traces/{f}" for f in valid_files]
-
-    else:  # if args.target_type == "ball":
-        metrica_files = ["match1.csv", "match2.csv", "match3_valid.csv"]
-        metrica_paths = [f"data/metrica_traces/{f}" for f in metrica_files]
-
-        gps_files = os.listdir("data/gps_event_traces_gk_pred")
-        gps_paths = [f"data/gps_event_traces_gk_pred/{f}" for f in gps_files]
-        gps_paths.sort()
-
-        assert args.train_fito or args.train_metrica
-        train_paths = []
-        if args.train_fito:
-            train_paths += gps_paths[:10]
-        if args.train_metrica:
-            train_paths += metrica_paths[:-1]
-
-        assert args.valid_fito or args.valid_metrica
-        valid_paths = []
-        if args.valid_fito:
-            valid_paths += gps_paths[-5:-3]
-        if args.valid_metrica:
-            valid_paths += metrica_paths[-1:]
-
-    if args.model.startswith("team_ball") or args.model.startswith("player_ball"):
-        macro_type = args.macro_type
-    else:
-        macro_type = None
-
-    nw = len(model.device_ids) * 4
     train_dataset = SoccerDataset(
         data_paths=train_paths,
+        macro_type=args.macro_type,
         target_type=args.target_type,
-        macro_type=macro_type,
-        train=True,
         n_features=args.n_features,
+        window_seconds=args.window_seconds,
+        window_stride=args.window_stride,
         target_speed=args.speed_loss,
         flip_pitch=args.flip_pitch,
     )
     test_dataset = SoccerDataset(
         data_paths=valid_paths,
+        macro_type=args.macro_type,
         target_type=args.target_type,
-        macro_type=macro_type,
-        train=False,
         n_features=args.n_features,
+        window_seconds=args.window_seconds,
+        window_stride=args.window_stride,
         target_speed=args.speed_loss,
         flip_pitch=args.flip_pitch,
     )
+    nw = len(model.device_ids) * 4
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=nw, pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=True, num_workers=nw, pin_memory=True)
+    valid_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=True, num_workers=nw, pin_memory=True)
 
     # Train loop
     best_total_loss = args.best_total_loss
@@ -413,16 +342,16 @@ if __name__ == "__main__":
     epochs_since_best = 0
     lr = max(args.start_lr, args.min_lr)
 
-    for e in range(n_epochs):
+    for e in range(args.n_epochs):
         epoch = e + 1
 
-        hyperparams = {"pretrain": epoch <= pretrain_time}
+        hyperparams = {"pretrain": epoch <= args.pretrain_time}
 
         # Set a custom learning rate schedule
         if epochs_since_best == 3 and lr > args.min_lr:
             # Load previous best model
             path = "{}/model/{}_state_dict_best.pt".format(save_path, args.model)
-            if epoch <= pretrain_time:
+            if epoch <= args.pretrain_time:
                 path = "{}/model/{}_state_dict_best_pretrain.pt".format(save_path, args.model)
             state_dict = torch.load(path)
 
@@ -439,30 +368,30 @@ if __name__ == "__main__":
         printlog(hyperparams_str(epoch, hyperparams))
         start_time = time.time()
 
-        train_losses = run_epoch(model, optimizer, train=True, print_every=print_every)
+        train_losses = run_epoch(model, optimizer, train=True, print_batch=args.print_batch)
         printlog("Train:\t" + loss_str(train_losses))
 
-        test_losses = run_epoch(model, optimizer, train=False)
-        printlog("Test:\t" + loss_str(test_losses))
+        valid_losses = run_epoch(model, optimizer, train=False)
+        printlog("Test:\t" + loss_str(valid_losses))
 
         epoch_time = time.time() - start_time
         printlog("Time:\t {:.2f}s".format(epoch_time))
 
-        test_total_loss = sum([value for key, value in test_losses.items() if key.endswith("loss")])
+        valid_total_loss = sum([value for key, value in valid_losses.items() if key.endswith("loss")])
 
         # Best model on test set
-        if best_total_loss == 0 or test_total_loss < best_total_loss:
-            best_total_loss = test_total_loss
+        if best_total_loss == 0 or valid_total_loss < best_total_loss:
+            best_total_loss = valid_total_loss
             epochs_since_best = 0
 
             path = "{}/model/{}_state_dict_best.pt".format(save_path, args.model)
-            if epoch <= pretrain_time:
+            if epoch <= args.pretrain_time:
                 path = "{}/model/{}_state_dict_best_pretrain.pt".format(save_path, args.model)
             torch.save(model.module.state_dict(), path)
             printlog("######## Best Total Loss ########")
 
-        if "pos_error" in test_losses and (best_pos_error == 0 or test_losses["pos_error"] < best_pos_error):
-            best_pos_error = test_losses["pos_error"]
+        if "pos_error" in valid_losses and (best_pos_error == 0 or valid_losses["pos_error"] < best_pos_error):
+            best_pos_error = valid_losses["pos_error"]
             epochs_since_best = 0
 
             path = "{}/model/{}_state_dict_best_pe.pt".format(save_path, args.model)
@@ -470,13 +399,13 @@ if __name__ == "__main__":
             printlog("######## Best Pos Error #########")
 
         # Periodically save model
-        if epoch % save_every == 0:
+        if epoch % args.save_epoch == 0:
             path = "{}/model/{}_state_dict_{}.pt".format(save_path, args.model, epoch)
             torch.save(model.module.state_dict(), path)
             printlog("########## Saved Model ##########")
 
         # End of pretrain stage
-        if epoch == pretrain_time:
+        if epoch == args.pretrain_time:
             printlog("######### End Pretrain ##########")
             best_total_loss = 0
             epochs_since_best = 0
@@ -484,7 +413,7 @@ if __name__ == "__main__":
 
             state_dict = torch.load("{}/model/{}_state_dict_best_pretrain.pt".format(save_path, args.model))
             model.module.load_state_dict(state_dict)
-            test_losses = run_epoch(model, optimizer, train=False)
-            printlog("Test:\t" + loss_str(test_losses))
+            valid_losses = run_epoch(model, optimizer, train=False)
+            printlog("Test:\t" + loss_str(valid_losses))
 
     printlog("Best Test Loss: {:.4f}".format(best_total_loss))
