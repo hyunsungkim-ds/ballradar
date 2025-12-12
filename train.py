@@ -30,14 +30,14 @@ def printlog(line):
 def loss_str(losses: dict):
     ret = ""
     for key, value in losses.items():
-        ret += " {}: {:.4f} |".format(key, np.mean(value))
+        ret += f" {key}: {np.mean(value):.4f} |"
     # if len(losses) > 1:
     #     ret += " total_loss: {:.4f} |".format(sum(losses.values()))
     return ret[:-2]
 
 
 def hyperparams_str(epoch, hp):
-    ret = "\nEpoch {:d}".format(epoch)
+    ret = f"\nEpoch {epoch:d}"
     if hp["pretrain"]:
         ret += " (pretrain)"
     return ret
@@ -280,7 +280,7 @@ if __name__ == "__main__":
     args_dict["total_params"] = num_trainable_params(model)
 
     # Create save path and saving parameters
-    save_path = "saved/{:02d}".format(args.trial)
+    save_path = f"saved/{args.trial:03d}"
     if not os.path.exists(save_path):
         os.makedirs(save_path)
         os.makedirs(save_path + "/model")
@@ -289,7 +289,7 @@ if __name__ == "__main__":
 
     # Continue a previous experiment or start a new one
     if args.cont:
-        state_dict = torch.load("{}/model/{}_state_dict_best_pe.pt".format(save_path, args.model))
+        state_dict = torch.load(f"{save_path}/model/state_dict_best_pe.pt", weights_only=False)
         model.module.load_state_dict(state_dict)
 
     data_dir = "data/sportec/tracking_processed"
@@ -328,14 +328,14 @@ if __name__ == "__main__":
         # Set a custom learning rate schedule
         if epochs_since_best == 3 and lr > args.min_lr:
             # Load previous best model
-            path = "{}/model/{}_state_dict_best.pt".format(save_path, args.model)
+            path = f"{save_path}/model/state_dict_best.pt"
             if epoch <= args.pretrain_time:
-                path = "{}/model/{}_state_dict_best_pretrain.pt".format(save_path, args.model)
-            state_dict = torch.load(path)
+                path = f"{save_path}/model/state_dict_best_pretrain.pt"
+            state_dict = torch.load(path, weights_only=False)
 
             # Decrease learning rate
             lr = max(lr * 0.5, args.min_lr)
-            printlog("########## lr {} ##########".format(lr))
+            printlog(f"########## lr {lr} ##########")
             epochs_since_best = 0
         else:
             epochs_since_best += 1
@@ -353,7 +353,7 @@ if __name__ == "__main__":
         printlog("Test:\t" + loss_str(valid_losses))
 
         epoch_time = time.time() - start_time
-        printlog("Time:\t {:.2f}s".format(epoch_time))
+        printlog(f"Time:\t {epoch_time:.2f}s")
 
         valid_total_loss = sum([value for key, value in valid_losses.items() if key.endswith("loss")])
 
@@ -362,23 +362,24 @@ if __name__ == "__main__":
             best_total_loss = valid_total_loss
             epochs_since_best = 0
 
-            path = "{}/model/{}_state_dict_best.pt".format(save_path, args.model)
             if epoch <= args.pretrain_time:
-                path = "{}/model/{}_state_dict_best_pretrain.pt".format(save_path, args.model)
+                path = f"{save_path}/model/state_dict_best_pretrain.pt"
+            else:
+                path = f"{save_path}/model/state_dict_best.pt"
+
             torch.save(model.module.state_dict(), path)
             printlog("######## Best Total Loss ########")
 
         if "pos_error" in valid_losses and (best_pos_error == 0 or valid_losses["pos_error"] < best_pos_error):
             best_pos_error = valid_losses["pos_error"]
             epochs_since_best = 0
-
-            path = "{}/model/{}_state_dict_best_pe.pt".format(save_path, args.model)
+            path = f"{save_path}/model/state_dict_best_pe.pt"
             torch.save(model.module.state_dict(), path)
             printlog("######## Best Pos Error #########")
 
         # Periodically save model
         if epoch % args.save_epoch == 0:
-            path = "{}/model/{}_state_dict_{}.pt".format(save_path, args.model, epoch)
+            path = f"{save_path}/model/state_dict_{epoch}.pt"
             torch.save(model.module.state_dict(), path)
             printlog("########## Saved Model ##########")
 
@@ -389,9 +390,9 @@ if __name__ == "__main__":
             epochs_since_best = 0
             lr = max(args.start_lr, args.min_lr)
 
-            state_dict = torch.load("{}/model/{}_state_dict_best_pretrain.pt".format(save_path, args.model))
+            state_dict = torch.load(f"{save_path}/model/state_dict_best_pretrain.pt", weights_only=False)
             model.module.load_state_dict(state_dict)
             valid_losses = run_epoch(model, optimizer, train=False)
             printlog("Test:\t" + loss_str(valid_losses))
 
-    printlog("Best Test Loss: {:.4f}".format(best_total_loss))
+    printlog(f"Best Test Loss: {best_total_loss:.4f}")

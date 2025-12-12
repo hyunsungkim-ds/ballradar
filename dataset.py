@@ -66,7 +66,7 @@ class SoccerDataset(Dataset):
                     continue
 
                 phase_tracking = tracking[tracking["phase_id"] == phase].copy()
-                player_cols = [f"{p}{x}" for p in active_players for x in self.feature_types]
+                player_cols = [f"{p}{ft}" for p in active_players for ft in self.feature_types]
 
                 left_gk, right_gk = utils.detect_keepers(phase_tracking)
                 left_team, right_team = left_gk.split("_")[0], right_gk.split("_")[0]
@@ -79,14 +79,14 @@ class SoccerDataset(Dataset):
                 input_cols = left_cols + right_cols  # Reorder teams so that the left team comes first
 
                 if macro_type == "player_poss" or target_type == "player_poss":
-                    input_cols += [f"{k}{x}" for k in outside_xy.keys() for x in self.feature_types]
+                    input_cols += [f"{k}{ft}" for k in outside_xy.keys() for ft in self.feature_types]
                     object_order = [re.sub(r"_[^_]+$", "", c) for c in input_cols[::n_features]]
                     poss_dict = dict(zip(object_order, np.arange(len(object_order))))
                     poss_dict["goal_left"] = len(outside_xy) - 4  # Same as out_left
                     poss_dict["goal_right"] = len(outside_xy) - 3  # Same as out_right
 
                 if target_type in ["gk", "ball"]:
-                    target_cols = [f"{p}{t}" for p in targets for t in ["_x", "_y"]]
+                    target_cols = [f"{p}{ft}" for p in targets for ft in ["_x", "_y"]]
 
                 for episode in phase_tracking["episode_id"].unique():
                     if episode == 0:
@@ -262,16 +262,16 @@ class SoccerDataset(Dataset):
                 left_gk, right_gk = utils.detect_keepers(tracking[tracking["phase_id"] == phase])
                 targets = [left_gk, right_gk] if self.target_type == "gk" else [self.target_type]
 
-                player_cols = [f"{p}{x}" for p in active_players for x in self.feature_types]
+                player_cols = [f"{p}{ft}" for p in active_players for ft in self.feature_types]
                 input_cols = [c for c in player_cols if c.split("_")[0] not in targets]
 
                 if self.macro_type == "player_poss" or self.target_type == "player_poss":
-                    outside_xy = ["out_left", "out_right", "out_bottom", "out_top"]
-                    input_cols += [f"{k}{x}" for k in outside_xy for x in self.feature_types]
+                    outside_keys = ["out_left", "out_right", "out_bottom", "out_top"]
+                    input_cols += [f"{k}{ft}" for k in outside_keys for ft in self.feature_types]
                     object_order = [c.rsplit("_", 1)[0] for c in input_cols[:: self.n_features]]
                     poss_dict = dict(zip(object_order, np.arange(len(object_order))))
-                    poss_dict["goal_left"] = len(outside_xy) - 4
-                    poss_dict["goal_right"] = len(outside_xy) - 3
+                    poss_dict["goal_left"] = len(outside_keys) - 4
+                    poss_dict["goal_right"] = len(outside_keys) - 3
 
                 for episode in tracking.loc[tracking["phase_id"] == phase, "episode_id"].unique():
                     if episode == 0:
