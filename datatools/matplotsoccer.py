@@ -8,11 +8,14 @@ from matplotlib.patches import Arc
 from matplotlib.pyplot import cm
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
-# Modified from https://github.com/TomDecroos/matplotsoccer/blob/master/matplotsoccer/fns.py
+"""
+For plotting soccer fields for animation
+Modified from https://github.com/TomDecroos/matplotsoccer.git
+"""
 
 spadl_config = {
-    "length": 108,
-    "width": 72,
+    "length": 105,
+    "width": 68,
     "penalty_box_length": 16.5,
     "penalty_box_width": 40.3,
     "six_yard_box_length": 5.5,
@@ -40,7 +43,12 @@ def _plot_rectangle(x1, y1, x2, y2, ax, color):
     ax.plot([x1, x2], [y2, y2], color=color, zorder=zline)
 
 
-def field(color="white", fig=None, ax=None, figsize=None, show=True):
+def field(color="green", field_length=None, field_width=None, fig=None, ax=None, figsize=None, show=True):
+    if field_length is not None:
+        spadl_config["length"] = field_length
+    if field_width is not None:
+        spadl_config["width"] = field_width
+
     if color == "white":
         return _field(
             fig=fig,
@@ -363,7 +371,7 @@ def actions(
         dx = (xmax - xmin) / 2
         my = (ymin + ymax) / 2
         dy = (ymax - ymin) / 2
-        if type(zoom) == bool:
+        if isinstance(zoom, bool):
             d = max(dx, dy)
         else:
             d = zoom
@@ -461,21 +469,6 @@ def actions(
                     length_includes_head=True,
                     zorder=zaction,
                 )
-
-    # leg = plt.legend(loc=9,prop={'family': 'monospace','size':12})
-    # if show_legend:
-    #     if legloc == "top":
-    #         leg = plt.legend(
-    #             bbox_to_anchor=(0.5, 1.05),
-    #             loc="lower center",
-    #             prop={"family": "monospace"},
-    #         )
-    #     elif legloc == "right":
-    #         leg = plt.legend(
-    #             bbox_to_anchor=(1.05, 0.5),
-    #             loc="center left",
-    #             prop={"family": "monospace"},
-    #         )
 
     if show:
         plt.show()
