@@ -51,14 +51,13 @@ class SoccerDataset(Dataset):
 
         for f in tqdm(data_paths):
             tracking = pd.read_parquet(f)
+            phases = utils.summarize_phases(tracking)
 
             if macro_type == "player_poss" or target_type == "player_poss":
                 for k, xy in outside_xy.items():
                     tracking[f"{k}_x"] = xy[0]
                     tracking[f"{k}_y"] = xy[1]
                     tracking[[f"{k}_vx", f"{k}_vy", f"{k}_speed", f"{k}_accel"]] = 0
-
-            phases = utils.summarize_phases(tracking)
 
             for phase, row in phases.iterrows():
                 active_players = row["active_players"]
@@ -81,9 +80,9 @@ class SoccerDataset(Dataset):
                 if macro_type == "player_poss" or target_type == "player_poss":
                     input_cols += [f"{k}{ft}" for k in outside_xy.keys() for ft in self.feature_types]
                     object_order = [re.sub(r"_[^_]+$", "", c) for c in input_cols[::n_features]]
-                    poss_dict = dict(zip(object_order, np.arange(len(object_order))))
-                    poss_dict["goal_left"] = len(outside_xy) - 4  # Same as out_left
-                    poss_dict["goal_right"] = len(outside_xy) - 3  # Same as out_right
+                    poss_dict = dict(zip(object_order, np.arange(len(object_order)).astype(np.int16)))
+                    poss_dict["goal_left"] = np.int16(len(object_order) - 4)  # Same as out_left
+                    poss_dict["goal_right"] = np.int16(len(object_order) - 3)  # Same as out_right
 
                 if target_type in ["gk", "ball"]:
                     target_cols = [f"{p}{ft}" for p in targets for ft in ["_x", "_y"]]
@@ -309,11 +308,3 @@ class SoccerDataset(Dataset):
                         idx += 1
 
         return pd.DataFrame(meta)
-
-
-if __name__ == "__main__":
-    dir = "data/metrica_traces"
-    filepaths = [f"{dir}/{f}" for f in os.listdir(dir) if f.endswith(".csv")]
-    filepaths.sort()
-    dataset = SoccerDataset(filepaths[-1:], target_type="gk", train=False, save=False)
-    print(dataset[10000][2])
