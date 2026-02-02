@@ -9,11 +9,9 @@ import matplotlib.colors as cm
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import scipy.signal as signal
 import torch
 import torch.nn as nn
 from matplotlib import animation
-from scipy.ndimage import shift
 from tqdm import tqdm
 
 from dataset import SoccerDataset
@@ -38,59 +36,6 @@ class TraceHelper:
     def player_to_cols(p):
         return [f"{p}_x", f"{p}_y", f"{p}_vx", f"{p}_vy", f"{p}_speed", f"{p}_accel"]
 
-    def calc_single_player_running_features(self, p: str, remove_outliers=True, smoothing=True, gk_smoothing=False):
-        if remove_outliers:
-            MAX_SPEED = 12
-            MAX_ACCEL = 8
-
-        if smoothing:
-            W_LEN = 11
-            P_ORDER = 2
-
-        x = self.traces[f"{p}_x"].dropna()
-        y = self.traces[f"{p}_y"].dropna()
-        if smoothing and gk_smoothing:
-            x = pd.Series(signal.savgol_filter(x, window_length=21, polyorder=P_ORDER))
-            y = pd.Series(signal.savgol_filter(y, window_length=21, polyorder=P_ORDER))
-
-        vx = np.diff(x.values, prepend=x.iloc[0]) / 0.1
-        vy = np.diff(y.values, prepend=y.iloc[0]) / 0.1
-
-        if remove_outliers:
-            speeds = np.sqrt(vx**2 + vy**2)
-            is_speed_outlier = speeds > MAX_SPEED
-            is_accel_outlier = np.abs(np.diff(speeds, append=speeds[-1]) / 0.1) > MAX_ACCEL
-            is_outlier = is_speed_outlier | is_accel_outlier | shift(is_accel_outlier, 1, cval=True)
-            vx = pd.Series(np.where(is_outlier, np.nan, vx)).interpolate(limit_direction="both").values
-            vy = pd.Series(np.where(is_outlier, np.nan, vy)).interpolate(limit_direction="both").values
-
-        if smoothing:
-            vx = signal.savgol_filter(vx, window_length=W_LEN, polyorder=P_ORDER)
-            vy = signal.savgol_filter(vy, window_length=W_LEN, polyorder=P_ORDER)
-
-        speeds = np.sqrt(vx**2 + vy**2)
-        accels = np.diff(speeds, append=speeds[-1]) / 0.1
-
-        if smoothing:
-            accels = signal.savgol_filter(accels, window_length=W_LEN, polyorder=P_ORDER)
-
-        self.traces.loc[x.index, TraceHelper.player_to_cols(p)] = np.stack([x, y, vx, vy, speeds, accels]).round(6).T
-
-    def calc_running_features(self, remove_outliers=True, smoothing=True):
-        data_cols = self.team1_cols + self.team2_cols
-        new_cols = [c for c in data_cols if c not in self.traces.columns]
-        self.traces = pd.concat([self.traces, pd.DataFrame(index=self.traces.index, columns=new_cols)], axis=1)
-
-        for p in tqdm(self.team1_players + self.team2_players, desc="Calculating running features"):
-            self.calc_single_player_running_features(p, remove_outliers, smoothing)
-
-        if "ball_x" in self.traces.columns:
-            data_cols += ["ball_x", "ball_y"]
-        self.traces[data_cols] = self.traces[data_cols].astype(float)
-
-        meta_cols = self.traces.columns[: len(self.traces.columns) - len(data_cols)].tolist()
-        self.traces = self.traces[meta_cols + data_cols]
-
     @staticmethod
     def ffill_transition(team_poss):
         team = team_poss.iloc[0]
@@ -114,13 +59,13 @@ class TraceHelper:
         team_poss = pd.Series(index=self.traces.index, dtype=str)
 
         for phase in self.traces["phase"].unique():
-            if type(phase) == str:  # For GPS-event traces, ignore phases with n_players < 22
+            if isinstance(phase, str):  # For GPS-event traces, ignore phases with n_players < 22
                 phase_tuple = [int(i) for i in phase[1:-1].split(",")]
                 if phase_tuple[0] < 0 or phase_tuple[1] < 0:
                     continue
 
             phase_traces = self.traces[self.traces["phase"] == phase]
-            phase_gks = SoccerDataset.detect_goalkeepers(phase_traces)
+            phase_gks = SoccerDataset.detect_keepers(phase_traces)
             team1_code, team2_code = phase_gks[0][0], phase_gks[1][0]
 
             ball_in_left = phase_traces[xy_cols].mean(axis=1) < self.pitch_size[0] / 2
@@ -131,10 +76,10 @@ class TraceHelper:
     @staticmethod
     def predict_episode(
         model: nn.Module,
-        input: torch.FloatTensor,
-        macro_target: torch.FloatTensor = None,
-        micro_target: torch.FloatTensor = None,
-        random_mask: torch.BoolTensor = None,
+        input: torch.Tensor,
+        macro_target: torch.Tensor = None,
+        micro_target: torch.Tensor = None,
+        random_mask: torch.Tensor = None,
         split=False,
         vary_weights=True,
         wlen=100,
@@ -206,7 +151,7 @@ class TraceHelper:
             macro_pred_df = pd.DataFrame(index=self.traces.index, columns=macro_cols, dtype=float)
 
         if macro_type == "player_poss" or target_type == "player_poss":
-            outside_labels = ["OUT-L", "OUT-R", "OUT-B", "OUT-T"]
+            outside_labels = ["out_left", "out_right", "out_bottom", "out_top"]
             outside_x = [0, self.pitch_size[0], self.pitch_size[0] / 2, self.pitch_size[0] / 2]
             outside_y = [self.pitch_size[1] / 2, self.pitch_size[1] / 2, 0, self.pitch_size[1]]
 
@@ -230,7 +175,7 @@ class TraceHelper:
             gks = []
             for phase in self.traces["phase"].unique():
                 phase_traces = self.traces[self.traces["phase"] == phase]
-                phase_gks = SoccerDataset.detect_goalkeepers(phase_traces)
+                phase_gks = SoccerDataset.detect_keepers(phase_traces)
                 for gk in phase_gks:
                     if gk not in gks:
                         gks.append(gk)
@@ -256,14 +201,14 @@ class TraceHelper:
             sum_real_loss = 0
 
         for phase in self.traces["phase"].unique():
-            if type(phase) == str:  # For GPS-event traces, ignore phases with n_players < 22
+            if isinstance(phase, str):  # For GPS-event traces, ignore phases with n_players < 22
                 phase_tuple = [int(i) for i in phase[1:-1].split(",")]
                 if phase_tuple[0] < 0 or phase_tuple[1] < 0:
                     continue
 
             phase_traces = self.traces[self.traces["phase"] == phase]
             phase_player_cols = phase_traces[player_cols].dropna(axis=1, how="all").columns
-            phase_gks = SoccerDataset.detect_goalkeepers(phase_traces)
+            phase_gks = SoccerDataset.detect_keepers(phase_traces)
             team1_code, team2_code = phase_gks[0][0], phase_gks[1][0]
 
             if target_type == "gk":
@@ -285,14 +230,14 @@ class TraceHelper:
                 if macro_type == "player_poss":
                     macro_cols = [c.split("_")[0] for c in input_cols[::n_features]]
                     player_poss_dict = dict(zip(macro_cols, np.arange(len(macro_cols))))
-                    player_poss_dict["GOAL-L"] = len(macro_cols) - 4  # same as OUT-L
-                    player_poss_dict["GOAL-R"] = len(macro_cols) - 3  # same as OUT-R
+                    player_poss_dict["goal_left"] = len(macro_cols) - 4  # same as out_left
+                    player_poss_dict["goal_right"] = len(macro_cols) - 3  # same as out_right
 
                 if target_type == "player_poss":
                     output_cols = [c.split("_")[0] for c in input_cols[::n_features]]
                     player_poss_dict = dict(zip(output_cols, np.arange(len(output_cols))))
-                    player_poss_dict["GOAL-L"] = len(output_cols) - 4  # same as OUT-L
-                    player_poss_dict["GOAL-R"] = len(output_cols) - 3  # same as OUT-R
+                    player_poss_dict["goal_left"] = len(output_cols) - 4  # same as out_left
+                    player_poss_dict["goal_right"] = len(output_cols) - 3  # same as out_right
 
             if min(len(team1_cols), len(team2_cols)) < n_features * n_input_players:
                 continue

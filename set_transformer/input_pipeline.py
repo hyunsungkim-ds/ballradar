@@ -31,7 +31,7 @@ def get_random_datasets(b, k=4, min_size=100, max_size=500):
     # they have shape [b, k, 2]
 
     # probabilities to be in different clusters
-    pi = torch.distributions.Dirichlet(torch.Tensor(k*[1.0])).sample((b,))
+    pi = torch.distributions.Dirichlet(torch.Tensor(k * [1.0])).sample((b,))
     # shape [b, k]
 
     # assignments to each cluster
@@ -43,5 +43,5 @@ def get_random_datasets(b, k=4, min_size=100, max_size=500):
     selected_sigmas = torch.gather(sigmas, 1, labels)
 
     data = torch.normal(selected_centers, selected_sigmas)
-    params = {'means': centers, 'variances': sigmas ** 2, 'pis': pi}
+    params = {"means": centers, "variances": sigmas**2, "pis": pi}
     return data, params
