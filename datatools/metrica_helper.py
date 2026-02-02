@@ -1,7 +1,9 @@
 import math
 import os
+import re
 import sys
 from datetime import timedelta
+from typing import Optional, Tuple
 
 if not os.getcwd() in sys.path:
     sys.path.append(os.getcwd())
@@ -10,68 +12,100 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
+from datatools import config
 from datatools.trace_helper import TraceHelper
 
 
 class MetricaHelper(TraceHelper):
     def __init__(
         self,
-        team1_traces: pd.DataFrame = None,
-        team2_traces: pd.DataFrame = None,
-        traces_from_txt: pd.DataFrame = None,
-        traces_preprocessed: pd.DataFrame = None,
+        home_tracking: pd.DataFrame = None,
+        away_tracking: pd.DataFrame = None,
+        tracking_from_txt: pd.DataFrame = None,
+        tracking_processed: pd.DataFrame = None,
         events: pd.DataFrame = None,
-        pitch_size=(108, 72),
     ):
-        if traces_preprocessed is not None:
-            traces = traces_preprocessed
-            frames_to_episodes = traces[["frame", "episode"]].rename(columns={"frame": "start_frame"})
-            events = pd.merge(events, frames_to_episodes)
+        home_tracking = home_tracking.copy()
+        away_tracking = away_tracking.copy()
+        events = events.copy()
+
+        if tracking_processed is not None:
+            tracking = MetricaHelper.format_tracking(tracking_processed)
+            if "frame_id" in tracking.columns:
+                frames_to_episodes = tracking[["frame_id", "episode_id"]].rename(columns={"frame_id": "start_frame"})
+            else:
+                frames_to_episodes = tracking.reset_index()[["frame_id", "episode_id"]].rename(
+                    columns={"frame_id": "start_frame"}
+                )
+            events = MetricaHelper.format_events(events)
+            if events is not None:
+                events = pd.merge(events, frames_to_episodes)
 
         else:
-            if team1_traces is not None:
-                assert team2_traces is not None and traces_from_txt is None
-                traces = MetricaHelper.load_traces_from_csv(team1_traces, team2_traces)
+            if home_tracking is not None:
+                assert away_tracking is not None and tracking_from_txt is None
+                tracking = MetricaHelper.parse_tracking_from_csv(home_tracking, away_tracking)
             else:
-                assert team2_traces is None and traces_from_txt is not None
-                traces = traces_from_txt
+                assert away_tracking is None and tracking_from_txt is not None
+                tracking = tracking_from_txt
 
-            x_cols = [c for c in traces.columns if c.endswith("_x")]
-            y_cols = [c for c in traces.columns if c.endswith("_y")]
-            traces[x_cols] *= pitch_size[0]
-            traces[y_cols] *= pitch_size[1]
+            tracking = MetricaHelper.format_tracking(tracking)
 
-            players = [c[:-2] for c in traces.columns if c.endswith("_x") and not c.startswith("ball")]
-            events = MetricaHelper.load_events(events, players)
+            x_cols = [c for c in tracking.columns if c.endswith("_x")]
+            y_cols = [c for c in tracking.columns if c.endswith("_y")]
+            tracking[x_cols] *= config.PITCH_X
+            tracking[y_cols] *= config.PITCH_Y
 
-        super().__init__(traces, events, pitch_size)
+            players = [c[:-2] for c in tracking.columns if c.endswith("_x") and not c.startswith("ball")]
+            events = MetricaHelper.parse_events(events, players)
 
-    @staticmethod
-    def load_traces_from_csv(team1_traces: pd.DataFrame, team2_traces: pd.DataFrame) -> pd.DataFrame:
-        team1_players = [f"A{int(c[2][6:]):02d}" for c in team1_traces.columns[3:-2:2]]
-        team1_xy_cols = np.array([[f"{p}_x", f"{p}_y"] for p in team1_players]).flatten().tolist()
-        team1_traces.columns = ["session", "frame", "time"] + team1_xy_cols + ["ball_x", "ball_y"]
-        team1_traces = team1_traces.set_index("frame").astype(float)
-        team1_traces["session"] = team1_traces["session"].astype(int)
+        tracking, events = MetricaHelper._rebase_tracking_times(tracking, events)
 
-        team2_players = [f"B{int(c[2][6:]):02d}" for c in team2_traces.columns[3:-2:2]]
-        team2_xy_cols = np.array([[f"{p}_x", f"{p}_y"] for p in team2_players]).flatten().tolist()
-        team2_traces.columns = ["session", "frame", "time"] + team2_xy_cols + ["ball_x", "ball_y"]
-        team2_traces = team2_traces.set_index("frame").astype(float)
-        team2_traces["session"] = team2_traces["session"].astype(int)
-
-        header = team1_traces.columns[:-2].tolist() + team2_traces.columns[2:].tolist()
-        traces = pd.merge(team1_traces, team2_traces)[header]
-        traces.index = team1_traces.index.astype(int)
-        return traces
+        super().__init__(tracking, events)
 
     @staticmethod
-    def load_events(events: pd.DataFrame, players: list) -> pd.DataFrame:
+    def _parse_player_id(player_id: str, team: Optional[str] = None) -> str:
+        if pd.isna(player_id):
+            return np.nan
+        player_id = str(player_id).strip()
+        if player_id.startswith("home_") or player_id.startswith("away_"):
+            return player_id
+        match = re.match(r"^(A|B)(\d+)$", player_id)
+        if match:
+            team_prefix = "home" if match.group(1) == "A" else "away"
+            return f"{team_prefix}_{int(match.group(2))}"
+        match = re.match(r"^Player\s*(\d+)$", player_id, flags=re.IGNORECASE)
+        if match and team in ["home", "away"]:
+            return f"{team}_{int(match.group(1))}"
+        return player_id
+
+    @staticmethod
+    def parse_tracking_from_csv(home_tracking: pd.DataFrame, away_tracking: pd.DataFrame) -> pd.DataFrame:
+        home_players = [f"home_{int(c[2][6:])}" for c in home_tracking.columns[3:-2:2]]
+        home_xy_cols = np.array([[f"{p}_x", f"{p}_y"] for p in home_players]).flatten().tolist()
+        home_tracking.columns = ["period_id", "frame_id", "timestamp"] + home_xy_cols + ["ball_x", "ball_y"]
+        home_tracking = home_tracking.set_index("frame_id").astype(float)
+        home_tracking["period_id"] = home_tracking["period_id"].astype(int)
+
+        away_players = [f"away_{int(c[2][6:])}" for c in away_tracking.columns[3:-2:2]]
+        away_xy_cols = np.array([[f"{p}_x", f"{p}_y"] for p in away_players]).flatten().tolist()
+        away_tracking.columns = ["period_id", "frame_id", "timestamp"] + away_xy_cols + ["ball_x", "ball_y"]
+        away_tracking = away_tracking.set_index("frame_id").astype(float)
+        away_tracking["period_id"] = away_tracking["period_id"].astype(int)
+
+        header = home_tracking.columns[:-2].tolist() + away_tracking.columns[2:].tolist()
+        tracking = pd.merge(home_tracking, away_tracking)[header]
+        tracking.index = home_tracking.index.astype(int)
+        tracking.index.name = "frame_id"
+        return tracking
+
+    @staticmethod
+    def parse_events(events: pd.DataFrame, players: list) -> pd.DataFrame:
         events.columns = [
             "team",
             "type",
             "subtype",
-            "session",
+            "period_id",
             "start_frame",
             "start_time",
             "end_frame",
@@ -84,35 +118,147 @@ class MetricaHelper(TraceHelper):
             "end_y",
         ]
 
+        events["team"] = events["team"].str.lower()
         events.loc[events["subtype"].isna(), "subtype"] = events.loc[events["subtype"].isna(), "type"]
-        events["start_time"] = events["start_time"].apply(lambda x: math.ceil(x * 10) / 10).round(1)
-        events["end_time"] = events["end_time"].apply(lambda x: math.ceil(x * 10) / 10).round(1)
 
-        player_dict1 = dict(zip([f"Player {int(p[1:])}" for p in players], players))
-        player_dict2 = dict(zip([f"Player{int(p[1:])}" for p in players], players))
+        player_numbers = []
+        for p in players:
+            match = re.search(r"(\d+)$", p)
+            if match:
+                player_numbers.append((p, int(match.group(1))))
+
+        player_dict1 = dict(zip([f"Player {num}" for p, num in player_numbers], [p for p, num in player_numbers]))
+        player_dict2 = dict(zip([f"Player{num}" for p, num in player_numbers], [p for p, num in player_numbers]))
         player_dict = {**player_dict1, **player_dict2}
         player_dict[np.nan] = np.nan
 
-        events["from"] = events["from"].apply(lambda x: player_dict[x])
-        events["to"] = events["to"].apply(lambda x: player_dict[x])
+        def map_player_id(player_id, team):
+            if pd.isna(player_id):
+                return np.nan
+            mapped = MetricaHelper._parse_player_id(player_id, team=team)
+            if mapped != player_id:
+                return mapped
+            return player_dict.get(player_id, player_id)
+
+        events["from"] = events.apply(lambda row: map_player_id(row["from"], row["team"]), axis=1)
+        events["to"] = events.apply(lambda row: map_player_id(row["to"], row["team"]), axis=1)
 
         return events
 
-    def generate_phase_records(self):
-        players = self.team1_players + self.team2_players
-        player_x_cols = [f"{p}_x" for p in players]
+    @staticmethod
+    def format_tracking(tracking: pd.DataFrame) -> pd.DataFrame:
+        tracking = tracking.copy()
+        rename_map = {}
+        if "frame" in tracking.columns:
+            rename_map["frame"] = "frame_id"
+        if "session" in tracking.columns:
+            rename_map["session"] = "period_id"
+        if "time" in tracking.columns:
+            rename_map["time"] = "timestamp"
+        if rename_map:
+            tracking = tracking.rename(columns=rename_map)
+        if tracking.index.name == "frame":
+            tracking.index.name = "frame_id"
 
-        self.traces["phase"] = 0
+        rename_map = {}
+        for col in tracking.columns:
+            match = re.match(r"^(A|B)(\d+)_(.+)$", col)
+            if match:
+                team_prefix = "home" if match.group(1) == "A" else "away"
+                rename_map[col] = f"{team_prefix}_{int(match.group(2))}_{match.group(3)}"
+        if rename_map:
+            tracking = tracking.rename(columns=rename_map)
+
+        for col in ["player_id", "event_player"]:
+            if col in tracking.columns:
+                tracking[col] = tracking[col].apply(MetricaHelper._parse_player_id)
+        if "team_poss" in tracking.columns:
+            tracking["team_poss"] = tracking["team_poss"].replace({"A": "home", "B": "away"})
+
+        if "frame_id" in tracking.columns and tracking.index.name != "frame_id":
+            tracking = tracking.set_index("frame_id")
+        elif tracking.index.name is None and "frame_id" not in tracking.columns:
+            tracking.index.name = "frame_id"
+        return tracking
+
+    @staticmethod
+    def format_events(events: pd.DataFrame) -> pd.DataFrame:
+        if events is None:
+            return None
+        events = events.copy()
+        if "session" in events.columns and "period_id" not in events.columns:
+            events = events.rename(columns={"session": "period_id"})
+        if "team" in events.columns:
+            events["team"] = events["team"].str.lower()
+        for col in ["from", "to"]:
+            if col in events.columns:
+                events[col] = events[col].apply(MetricaHelper._parse_player_id)
+        return events
+
+    @staticmethod
+    def _rebase_tracking_times(
+        tracking: pd.DataFrame,
+        events: pd.DataFrame = None,
+        frame_dt: float = 0.04,
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        tracking = tracking.copy()
+        events = events.copy() if events is not None else None
+
+        frame_id_series = None
+        if "frame_id" in tracking.columns:
+            tracking["frame_id"] = tracking["frame_id"].astype(int)
+            tracking["frame_id"] = (tracking["frame_id"] - 1).clip(lower=0)
+            frame_id_series = tracking["frame_id"]
+        elif tracking.index.name == "frame_id":
+            tracking.index = tracking.index.astype(int)
+            tracking.index = pd.Index(np.maximum(tracking.index - 1, 0), name="frame_id")
+            frame_id_series = tracking.index.to_series(index=tracking.index)
+
+        period_start_frames = None
+        recomputed_timestamp = False
+        if "period_id" in tracking.columns and frame_id_series is not None:
+            period_start_frames = frame_id_series.groupby(tracking["period_id"]).min().to_dict()
+            period_offsets = tracking["period_id"].map(period_start_frames)
+            tracking["timestamp"] = ((frame_id_series - period_offsets) * frame_dt - frame_dt).clip(lower=0).round(2)
+            recomputed_timestamp = True
+
+        if not recomputed_timestamp and "timestamp" in tracking.columns:
+            tracking["timestamp"] = (tracking["timestamp"] - frame_dt).clip(lower=0).round(2)
+
+        if events is not None:
+            for col in ["start_frame", "end_frame"]:
+                if col in events.columns:
+                    events[col] = pd.to_numeric(events[col], errors="coerce")
+                    events[col] = (events[col] - 1).clip(lower=0)
+
+            if period_start_frames is not None and "period_id" in events.columns:
+                period_offsets = events["period_id"].map(period_start_frames)
+                if "start_frame" in events.columns:
+                    events["start_time"] = ((events["start_frame"] - period_offsets) * frame_dt).round(2)
+                if "end_frame" in events.columns:
+                    events["end_time"] = ((events["end_frame"] - period_offsets) * frame_dt).round(2)
+
+            for col in ["start_time", "end_time"]:
+                if col in events.columns:
+                    events[col] = (events[col] - frame_dt).clip(lower=0).round(2)
+
+        return tracking, events
+
+    @staticmethod
+    def generate_phase_records(tracking: pd.DataFrame) -> pd.DataFrame:
+        home_players = sorted({c[:-2] for c in tracking.columns if re.match(r"home_\d+_x", c)})
+        away_players = sorted({c[:-2] for c in tracking.columns if re.match(r"away_\d+_x", c)})
+        player_x_cols = [f"{p}_x" for p in home_players + away_players]
+
         play_records = []
         phase_records = []
 
-        for p in players:
-            valid_player_idx = self.traces[self.traces[f"{p}_x"].notna()].index
+        for p in home_players + away_players:
+            valid_player_idx = tracking[tracking[f"{p}_x"].notna()].index
             f0 = valid_player_idx[0]
             f1 = valid_player_idx[-1]
 
-            if len(self.traces.loc[f1, player_x_cols].dropna()) > 22:
-                self.traces.loc[f1, [f"{p}_x", f"{p}_y"]] = np.nan
+            if len(tracking.loc[f1, player_x_cols].dropna()) > 22:
                 play_records.append([p, f0, f1 - 1])
             else:
                 play_records.append([p, f0, f1])
@@ -120,120 +266,61 @@ class MetricaHelper(TraceHelper):
         play_records = pd.DataFrame(play_records, columns=["object", "start_frame", "end_frame"]).set_index("object")
 
         change_frames = play_records["start_frame"].tolist()
-        change_frames.extend(
-            [
-                self.traces[self.traces["session"] == 2].index[0],
-                play_records["end_frame"].max(),
-            ]
-        )
+        last_frame = play_records["end_frame"].max()
+        change_frames.extend([tracking[tracking["period_id"] == 2].index[0], last_frame + 1])
         change_frames = list(set(change_frames))
         change_frames.sort()
 
         for i, f0 in enumerate(change_frames[:-1]):
             f1 = change_frames[i + 1] - 1
-            self.traces.loc[f0:f1, "phase"] = i + 1
+            period_id = tracking.loc[f0, "period_id"]
+            start_time = round(tracking.at[f0, "timestamp"], 2)
+            end_time = round(tracking.at[f1, "timestamp"], 2)
 
-            session = self.traces.loc[f0, "session"]
-            start_time = round(self.traces.at[f0, "time"], 1)
-            end_time = round(self.traces.at[f1 + 1, "time"] - 0.1, 1)
+            inplay_flags = tracking.loc[f0:f1, player_x_cols].notna().any()
+            player_ids = [c[:-2] for c in inplay_flags[inplay_flags].index]
 
-            inplay_flags = self.traces.loc[f0:f1, player_x_cols].notna().any()
-            player_codes = [c[:-2] for c in inplay_flags[inplay_flags].index]
+            phase_records.append([i + 1, period_id, start_time, end_time, player_ids])
 
-            phase_records.append([i + 1, session, start_time, end_time, player_codes])
+        header = ["phase_id", "period_id", "start_time", "end_time", "player_ids"]
+        return pd.DataFrame(phase_records, columns=header).set_index("phase_id")
 
-        header = ["phase", "session", "start_time", "end_time", "player_codes"]
-        self.phase_records = pd.DataFrame(phase_records, columns=header).set_index("phase")
+    @staticmethod
+    def label_phases(events: pd.DataFrame, tracking: pd.DataFrame) -> pd.DataFrame:
+        tracking = tracking.copy()
+        tracking["phase_id"] = 0
 
-    def downsample_to_10fps(self):
-        upsample_idxs = pd.date_range("2020-01-01 00:00:00.02", periods=len(self.traces) * 2, freq="0.02S")
-        xy_cols = [c for c in self.traces.columns if c.endswith("_x") or c.endswith("_y")]
-        traces_50fps = pd.DataFrame(index=upsample_idxs, columns=["session", "phase"] + xy_cols, dtype="float")
-        traces_50fps.index.name = "datetime"
+        phase_records = MetricaHelper.generate_phase_records(tracking)
 
-        traces_50fps.loc[traces_50fps.index[1::2]] = self.traces[["session", "phase"] + xy_cols].values
+        for phase_id, row in phase_records.iterrows():
+            period_id = row["period_id"]
+            start_time = row["start_time"]
+            end_time = row["end_time"]
 
-        traces_50fps[["session", "phase"]] = traces_50fps[["session", "phase"]].fillna(method="bfill").astype(int)
-        traces_50fps = traces_50fps.groupby("session", group_keys=False).apply(
-            lambda x: x.interpolate(limit_area="inside")
-        )
-        traces_50fps = traces_50fps[traces_50fps["phase"] > 0]
+            e_mask = (events["period_id"] == period_id) & events["start_time"].between(start_time, end_time)
+            t_mask = (tracking["period_id"] == period_id) & tracking["timestamp"].between(start_time, end_time)
+            events.loc[e_mask, "phase_id"] = phase_id
+            tracking.loc[t_mask, "phase_id"] = phase_id
 
-        traces_10fps_list = []
-        start_dt = pd.to_datetime("2020-01-01 00:00:00")
+        return events, tracking
 
-        for session in traces_50fps["session"].unique():
-            session_traces_50fps = traces_50fps[traces_50fps["session"] == session]
-            session_traces_10fps = session_traces_50fps.resample("0.1S", closed="right", label="right").mean()
+    @staticmethod
+    def label_episodes(
+        events: pd.DataFrame,
+        tracking: pd.DataFrame,
+        margin_sec: float = 2,
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        events = events.copy()
+        tracking = tracking.copy()
 
-            session_phase_records = self.phase_records[self.phase_records["session"] == session]
-            session_start_dt = start_dt + timedelta(seconds=session_phase_records["start_time"].iloc[0])
-            session_end_dt = start_dt + timedelta(seconds=session_phase_records["end_time"].iloc[-1])
-            traces_10fps_list.append(session_traces_10fps.loc[session_start_dt:session_end_dt])
-
-        traces_10fps = pd.concat(traces_10fps_list).reset_index()
-        assert isinstance(traces_10fps, pd.DataFrame)
-
-        traces_10fps[["session", "phase"]] = traces_10fps[["session", "phase"]].astype(int)
-        traces_10fps["time"] = (np.arange(len(traces_10fps)) * 0.1 + 0.1).round(1)
-        traces_10fps = traces_10fps.set_index("time")
-
-        for i in tqdm(self.events.index, desc="Combining tracking and event data"):
-            t0 = self.events.at[i, "start_time"]
-            t1 = self.events.at[i, "end_time"]
-            traces_10fps.loc[t0:t1, "event_player"] = self.events.at[i, "from"]
-            traces_10fps.loc[t0:t1, "event_type"] = self.events.at[i, "subtype"]
-
-        for phase in self.phase_records.index:
-            t0 = self.phase_records.at[phase, "start_time"]
-            t1 = self.phase_records.at[phase, "end_time"]
-            traces_10fps.loc[t0:t1, "phase"] = phase
-
-            valid_players = self.phase_records.at[phase, "player_codes"]
-            valid_cols = np.array([[f"{p}_x", f"{p}_y"] for p in valid_players]).flatten().tolist()
-            invalid_players = list(set(self.team1_players + self.team2_players) - set(valid_players))
-            invalid_cols = np.array([[f"{p}_x", f"{p}_y"] for p in invalid_players]).flatten().tolist()
-
-            traces_10fps.loc[t0:t1, invalid_cols] = np.nan
-            traces_10fps_interp = traces_10fps.loc[t0:t1, valid_cols].interpolate(limit_direction="both")
-            traces_10fps.loc[t0:t1, valid_cols] = traces_10fps_interp
-
-        traces_10fps["frame"] = np.arange(len(traces_10fps)) + 1
-        traces_10fps["episode"] = 0
-        traces_10fps["team_poss"] = np.nan
-        traces_10fps["player_poss"] = np.nan
-        traces_10fps[["ball_x", "ball_y"]] = (
-            traces_10fps[["session", "ball_x", "ball_y"]]
-            .groupby("session", group_keys=False)
-            .apply(lambda x: x.interpolate(limit_direction="both"))[["ball_x", "ball_y"]]
-        )
-
-        meta_cols = [
-            "frame",
-            "session",
-            "time",
-            "phase",
-            "episode",
-            "team_poss",
-            "player_poss",
-            "event_player",
-            "event_type",
-        ]
-        self.traces = traces_10fps.reset_index()[meta_cols + xy_cols]
-
-        self.events["start_frame"] = (self.events["start_time"] * 10).astype(int)
-        self.events["end_frame"] = (self.events["end_time"] * 10).astype(int)
-        phase_times = self.traces[["time", "phase"]].rename(columns={"time": "start_time"})
-        self.events = pd.merge(self.events, phase_times)
-
-    def split_into_episodes(self, margin_sec=2):
-        self.traces["episode"] = 0
+        tracking["episode_id"] = 0
         count = 0
 
-        for phase in self.traces["phase"].unique():
-            phase_traces = self.traces[self.traces["phase"] == phase]
-            phase_events = self.events[(self.events["phase"] == phase) & (self.events["type"] != "CARD")]
+        for phase in tracking["phase_id"].unique():
+            phase_events = events[(events["phase_id"] == phase) & (events["type"] != "CARD")]
+            phase_tracking = tracking[tracking["phase_id"] == phase]
             assert isinstance(phase_events, pd.DataFrame)
+            assert isinstance(phase_tracking, pd.DataFrame)
 
             time_diffs = phase_events["start_time"].diff().fillna(60)
             episodes = (time_diffs > 10).astype(int).cumsum() + count
@@ -246,97 +333,189 @@ class MetricaHelper(TraceHelper):
             for episode in first_event_times.index:
                 first_time = first_event_times.loc[episode] - margin_sec
                 last_time = last_event_times.loc[episode] + margin_sec
-                episode_idxs = phase_traces[
-                    (phase_traces["time"] >= first_time) & (phase_traces["time"] <= last_time)
-                ].index
-                self.traces.loc[episode_idxs, "episode"] = episode
+                episode_idxs = phase_tracking[phase_tracking["timestamp"].between(first_time, last_time)].index
+                tracking.loc[episode_idxs, "episode_id"] = episode
 
-    def find_gt_player_poss(self):
-        self.traces["player_poss"] = np.nan
-        if "frame" in self.traces.columns:
-            self.traces.set_index("frame", inplace=True)
+        tracking["ball_state"] = np.where(tracking["episode_id"] > 0, "alive", "dead")
+        return events, tracking
 
-        events = self.events[
-            ~(self.events["type"].isin(["CARRY", "CARD", "SET PIECE"]))
-            & ~((self.events["type"] == "BALL LOST") & (self.events["subtype"] == "THEFT"))
-            & ~((self.events["type"] == "CHALLENGE") & (self.events["subtype"].str.endswith("-LOST")))
+    @staticmethod
+    def label_poss(events: pd.DataFrame, tracking: pd.DataFrame) -> pd.DataFrame:
+        tracking = tracking.copy()
+
+        tracking["player_id"] = pd.Series(np.nan, index=tracking.index, dtype="object")
+        if "frame_id" in tracking.columns:
+            tracking.set_index("frame_id", inplace=True)
+
+        filtered_events = events[
+            ~(events["type"].isin(["CARRY", "CARD", "SET PIECE"]))
+            & ~((events["type"] == "BALL LOST") & (events["subtype"] == "THEFT"))
+            & ~((events["type"] == "CHALLENGE") & (events["subtype"].str.endswith("-LOST")))
         ].copy()
 
         type_order = ["BALL LOST", "CHALLENGE", "RECOVERY", "FAULT RECEIVED", "PASS", "SHOT", "BALL OUT"]
-        events["type"] = pd.Categorical(events["type"], categories=type_order)
-        events.sort_values(["start_time", "type"], inplace=True)
+        filtered_events["type"] = pd.Categorical(filtered_events["type"], categories=type_order)
+        filtered_events.sort_values(["start_time", "type"], inplace=True)
 
         out_frame = 0
 
-        for i in events.index:
-            event_type = events.at[i, "type"]
-            event_subtype = events.at[i, "subtype"]
-            start_frame = events.at[i, "start_frame"]
-            end_frame = events.at[i, "end_frame"]
+        for i in filtered_events.index:
+            event_type = filtered_events.at[i, "type"]
+            event_subtype = filtered_events.at[i, "subtype"]
+            start_frame = int(filtered_events.at[i, "start_frame"])
+            end_frame = int(filtered_events.at[i, "end_frame"])
 
-            if start_frame > out_frame + 20:
-                self.traces.at[start_frame, "player_poss"] = events.at[i, "from"]
-                if event_type == "PASS":
-                    self.traces.at[end_frame, "player_poss"] = events.at[i, "to"]
+            if start_frame in tracking.index:
+                tracking.at[start_frame, "player_id"] = filtered_events.at[i, "from"]
 
-                if event_type == "BALL OUT" or event_subtype.endswith("-OUT") or event_subtype.endswith("-GOAL"):
-                    out_x = events.at[i, "end_x"]
-                    out_y = events.at[i, "end_y"]
-                    if out_x < 0:
-                        out_label = "GOAL-L" if event_subtype.endswith("-GOAL") else "OUT-L"
-                    elif out_x > 1:
-                        out_label = "GOAL-R" if event_subtype.endswith("-GOAL") else "OUT-R"
-                    elif out_y < 0:
-                        out_label = "OUT-B"
-                    elif out_y > 1:
-                        out_label = "OUT-T"
-                    else:
-                        continue
+            to_player = filtered_events.at[i, "to"]
+            if pd.notna(to_player) and end_frame in tracking.index:
+                tracking.at[end_frame, "player_id"] = to_player
 
-                    out_frame = end_frame
-                    if i == events.index[-1]:
-                        self.traces.loc[out_frame:, "player_poss"] = out_label
-                    else:
-                        i_next = events[events["start_frame"] > out_frame + 20].index[0]
-                        next_frame = self.events.at[i_next, "start_frame"]
-                        self.traces.loc[out_frame : next_frame - 21, "player_poss"] = out_label
-                        self.traces.loc[next_frame - 20 : next_frame, "player_poss"] = self.events.at[i_next, "from"]
+            if event_type == "BALL OUT" or event_subtype.endswith("-OUT") or event_subtype.endswith("-GOAL"):
+                out_x = filtered_events.at[i, "end_x"]
+                out_y = filtered_events.at[i, "end_y"]
+                if out_x < 0:
+                    out_label = "goal_left" if event_subtype.endswith("-GOAL") else "out_left"
+                elif out_x > 1:
+                    out_label = "goal_right" if event_subtype.endswith("-GOAL") else "out_right"
+                elif out_y < 0:
+                    out_label = "out_bottom"
+                elif out_y > 1:
+                    out_label = "out_top"
+                else:
+                    continue
 
-        poss_prev = self.traces["player_poss"].fillna(method="ffill")
-        poss_next = self.traces["player_poss"].fillna(method="bfill")
-        self.traces["player_poss"] = poss_prev.where(poss_prev == poss_next, np.nan)
-        self.traces.reset_index(inplace=True)
+                out_frame = end_frame
+                if i == filtered_events.index[-1]:
+                    tracking.loc[out_frame:, "player_id"] = out_label
+                else:
+                    i_next = filtered_events[filtered_events["start_frame"] > out_frame + 50].index[0]
+                    next_frame = filtered_events.at[i_next, "start_frame"]
+                    tracking.loc[out_frame : next_frame - 51, "player_id"] = out_label
+                    tracking.loc[next_frame - 50 : next_frame, "player_id"] = filtered_events.at[i_next, "from"]
+
+        poss_prev = tracking["player_id"].ffill()
+        poss_next = tracking["player_id"].bfill()
+        tracking["player_id"] = poss_prev.where(poss_prev == poss_next, np.nan)
+        tracking["ball_owning_team_id"] = tracking["player_id"].apply(TraceHelper.get_team).bfill().ffill()
+
+        return tracking
+
+    def downsample_to_10fps(self, phase_records: pd.DataFrame):
+        if "phase_id" not in self.tracking.columns:
+            raise ValueError("phase_id column missing. Call apply_phase_records(phase_records) first.")
+        upsample_idxs = pd.date_range("2020-01-01 00:00:00.02", periods=len(self.tracking) * 2, freq="0.02S")
+        xy_cols = [c for c in self.tracking.columns if c.endswith("_x") or c.endswith("_y")]
+        traces_50fps = pd.DataFrame(index=upsample_idxs, columns=["period_id", "phase_id"] + xy_cols, dtype="float")
+        traces_50fps.index.name = "datetime"
+
+        traces_50fps.loc[traces_50fps.index[1::2]] = self.tracking[["period_id", "phase_id"] + xy_cols].values
+
+        traces_50fps[["period_id", "phase_id"]] = (
+            traces_50fps[["period_id", "phase_id"]].fillna(method="bfill").astype(int)
+        )
+        traces_50fps = traces_50fps.groupby("period_id", group_keys=False).apply(
+            lambda x: x.interpolate(limit_area="inside")
+        )
+        traces_50fps = traces_50fps[traces_50fps["phase_id"] > 0]
+
+        traces_10fps_list = []
+        start_dt = pd.to_datetime("2020-01-01 00:00:00")
+
+        for period_id in traces_50fps["period_id"].unique():
+            period_traces_50fps = traces_50fps[traces_50fps["period_id"] == period_id]
+            period_traces_10fps = period_traces_50fps.resample("0.1S", closed="right", label="right").mean()
+
+            period_phase_records = phase_records[phase_records["period_id"] == period_id]
+            period_start_dt = start_dt + timedelta(seconds=period_phase_records["start_time"].iloc[0])
+            period_end_dt = start_dt + timedelta(seconds=period_phase_records["end_time"].iloc[-1])
+            traces_10fps_list.append(period_traces_10fps.loc[period_start_dt:period_end_dt])
+
+        traces_10fps = pd.concat(traces_10fps_list).reset_index()
+        assert isinstance(traces_10fps, pd.DataFrame)
+
+        traces_10fps[["period_id", "phase_id"]] = traces_10fps[["period_id", "phase_id"]].astype(int)
+        traces_10fps["timestamp"] = (np.arange(len(traces_10fps)) * 0.1 + 0.1).round(1)
+        traces_10fps = traces_10fps.set_index("timestamp")
+
+        for i in tqdm(self.events.index, desc="Combining tracking and event data"):
+            t0 = self.events.at[i, "start_time"]
+            t1 = self.events.at[i, "end_time"]
+            traces_10fps.loc[t0:t1, "event_player"] = self.events.at[i, "from"]
+            traces_10fps.loc[t0:t1, "event_type"] = self.events.at[i, "subtype"]
+
+        for phase in phase_records.index:
+            t0 = phase_records.at[phase, "start_time"]
+            t1 = phase_records.at[phase, "end_time"]
+            traces_10fps.loc[t0:t1, "phase_id"] = phase
+
+            valid_players = phase_records.at[phase, "player_ids"]
+            valid_cols = np.array([[f"{p}_x", f"{p}_y"] for p in valid_players]).flatten().tolist()
+            invalid_players = list(set(self.home_players + self.away_players) - set(valid_players))
+            invalid_cols = np.array([[f"{p}_x", f"{p}_y"] for p in invalid_players]).flatten().tolist()
+
+            traces_10fps.loc[t0:t1, invalid_cols] = np.nan
+            traces_10fps_interp = traces_10fps.loc[t0:t1, valid_cols].interpolate(limit_direction="both")
+            traces_10fps.loc[t0:t1, valid_cols] = traces_10fps_interp
+
+        traces_10fps["frame_id"] = np.arange(len(traces_10fps)) + 1
+        traces_10fps["episode_id"] = 0
+        traces_10fps["team_poss"] = np.nan
+        traces_10fps["player_id"] = np.nan
+        traces_10fps[["ball_x", "ball_y"]] = (
+            traces_10fps[["period_id", "ball_x", "ball_y"]]
+            .groupby("period_id", group_keys=False)
+            .apply(lambda x: x.interpolate(limit_direction="both"))[["ball_x", "ball_y"]]
+        )
+
+        meta_cols = [
+            "frame_id",
+            "period_id",
+            "timestamp",
+            "phase_id",
+            "episode_id",
+            "team_poss",
+            "player_id",
+            "event_player",
+            "event_type",
+        ]
+        self.tracking = traces_10fps.reset_index()[meta_cols + xy_cols]
+
+        self.events["start_frame"] = (self.events["start_time"] * 10).astype(int)
+        self.events["end_frame"] = (self.events["end_time"] * 10).astype(int)
+        phase_times = self.tracking[["timestamp", "phase_id"]].rename(columns={"timestamp": "start_time"})
+        self.events = pd.merge(self.events, phase_times)
 
     @staticmethod
     def find_nearest_player(snapshot, players, team_code=None):
         if team_code is None:
-            x_cols = [f"{p}_x" for p in players]
-            y_cols = [f"{p}_y" for p in players]
+            team_players = players
         else:
-            x_cols = [f"{p}_x" for p in players if p[0] == team_code]
-            y_cols = [f"{p}_y" for p in players if p[0] == team_code]
+            team_players = [p for p in players if TraceHelper.get_team(p) == team_code]
+            if not team_players:
+                team_players = players
+
+        x_cols = [f"{p}_x" for p in team_players]
+        y_cols = [f"{p}_y" for p in team_players]
 
         ball_dists_x = (snapshot[x_cols] - snapshot["ball_x"]).astype(float).values
         ball_dists_y = (snapshot[y_cols] - snapshot["ball_y"]).astype(float).values
 
-        if team_code is None:
-            ball_dists = pd.Series(np.sqrt(ball_dists_x**2 + ball_dists_y**2), index=players)
-        else:
-            team_players = [p for p in players if p[0] == team_code]
-            ball_dists = pd.Series(np.sqrt(ball_dists_x**2 + ball_dists_y**2), index=team_players)
+        ball_dists = pd.Series(np.sqrt(ball_dists_x**2 + ball_dists_y**2), index=team_players)
 
         return ball_dists.idxmin()
 
     def correct_event_player_ids(self):
         print("\nCorrecting event player IDs:")
-        players = self.team1_players + self.team2_players
+        players = self.home_players + self.away_players
         player_x_cols = [f"{p}_x" for p in players]
         valid_types = ["BALL LOST", "BALL OUT", "CHALLENGE", "PASS", "RECOVERY", "SET PIECE", "SHOT"]
 
-        for phase in self.events["phase"].unique():
-            phase_events = self.events[self.events["phase"] == phase]
-            phase_traces = self.traces[self.traces["phase"] == phase]
-            phase_players = [c[:-2] for c in phase_traces[player_x_cols].dropna(axis=1).columns]
+        for phase in self.events["phase_id"].unique():
+            phase_events = self.events[self.events["phase_id"] == phase]
+            phase_tracking = self.tracking[self.tracking["phase_id"] == phase]
+            phase_players = [c[:-2] for c in phase_tracking[player_x_cols].dropna(axis=1).columns]
 
             switch_counts = pd.DataFrame(0, index=players, columns=players)
             for i in tqdm(phase_events.index, desc=f"Phase {phase}"):
@@ -353,23 +532,31 @@ class MetricaHelper(TraceHelper):
                     end_frame = phase_events.at[i, "end_frame"]
 
                     recorded_p_from = phase_events.at[i, "from"]
+                    recorded_team = TraceHelper.get_team(recorded_p_from)
+                    if pd.isna(recorded_team):
+                        recorded_team = None
                     detected_p_from = MetricaHelper.find_nearest_player(
-                        phase_traces.loc[start_frame - 1], phase_players, recorded_p_from[0]
+                        phase_tracking.loc[start_frame - 1], phase_players, recorded_team
                     )
                     switch_counts.at[recorded_p_from, detected_p_from] += 1
 
                     if event_type == "PASS":
                         recorded_p_to = phase_events.at[i, "to"]
+                        recorded_team = TraceHelper.get_team(recorded_p_to)
+                        if pd.isna(recorded_team):
+                            recorded_team = None
                         detected_p_to = MetricaHelper.find_nearest_player(
-                            phase_traces.loc[end_frame - 1], phase_players, recorded_p_to[0]
+                            phase_tracking.loc[end_frame - 1], phase_players, recorded_team
                         )
                         switch_counts.at[recorded_p_to, detected_p_to] += 1
 
             switch_dict = switch_counts[switch_counts.sum(axis=1) > 0].idxmax(axis=1).to_dict()
             self.events.loc[phase_events.index, "from"] = phase_events["from"].replace(switch_dict)
             self.events.loc[phase_events.index, "to"] = phase_events["to"].replace(switch_dict)
-            self.traces.loc[phase_traces.index, "event_player"] = phase_traces["event_player"].replace(switch_dict)
-            self.traces.loc[phase_traces.index, "player_poss"] = phase_traces["player_poss"].replace(switch_dict)
+            self.tracking.loc[phase_tracking.index, "event_player"] = phase_tracking["event_player"].replace(
+                switch_dict
+            )
+            self.tracking.loc[phase_tracking.index, "player_id"] = phase_tracking["player_id"].replace(switch_dict)
 
     def generate_pass_records(self, frames: pd.Series = None):
         events = self.events[self.events["start_frame"].isin(frames)] if frames is not None else self.events
@@ -386,7 +573,7 @@ class MetricaHelper(TraceHelper):
             event_subtype = events.at[i, "subtype"]
 
             if event_type == "PASS" or (event_type == "BALL LOST" and "INTERCEPTION" in event_subtype):
-                episode = events.at[i, "episode"]
+                episode = events.at[i, "episode_id"]
                 start_frame = events.at[i, "start_frame"]
                 passer = events.at[i, "from"]
 
@@ -408,7 +595,7 @@ class MetricaHelper(TraceHelper):
 
                 passes.append([episode, start_frame, end_frame, passer, receiver, success])
 
-        pass_cols = ["episode", "start_frame", "end_frame", "passer", "receiver", "success"]
+        pass_cols = ["episode_id", "start_frame", "end_frame", "passer", "receiver", "success"]
         return pd.DataFrame(passes, columns=pass_cols)
 
 
@@ -419,10 +606,10 @@ if __name__ == "__main__":
     events_file = f"data/metrica_traces/Sample_Game_{match_id}/Sample_Game_{match_id}_RawEventsData.csv"
     traces = pd.read_csv(trace_file, index_col=0)
     events = pd.read_csv(events_file, header=0)
-    helper = MetricaHelper(traces_from_txt=traces, events=events)
+    helper = MetricaHelper(tracking_from_txt=traces, events=events)
 
     helper.generate_phase_records()
     helper.downsample_to_10fps()
     # helper.split_into_episodes()
     # helper.calculate_running_feaetures(smoothing=True)
-    helper.find_gt_team_poss()
+    helper.label_team_poss()

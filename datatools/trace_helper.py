@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 from collections import Counter
 
@@ -15,22 +16,34 @@ from matplotlib import animation
 from tqdm import tqdm
 
 from dataset import SoccerDataset
+from datatools import config
 from models.utils import calc_class_acc, calc_real_loss, calc_trace_dist
 
 
 class TraceHelper:
-    def __init__(self, traces: pd.DataFrame, events: pd.DataFrame = None, pitch_size: tuple = (108, 72)):
-        self.traces = traces.dropna(axis=1, how="all").copy()
+    def __init__(self, tracking: pd.DataFrame, events: pd.DataFrame = None):
+        self.tracking = tracking.dropna(axis=1, how="all").copy()
         self.events = events
-        self.pitch_size = pitch_size
+        self.pitch_size = (config.PITCH_X, config.PITCH_Y)
 
-        self.team1_players = [c[:-2] for c in self.traces.columns if c.startswith("A") and c.endswith("_x")]
-        self.team2_players = [c[:-2] for c in self.traces.columns if c.startswith("B") and c.endswith("_x")]
+        home_players = sorted({c[:-2] for c in self.tracking.columns if re.match(r"home_\d+_x", c)})
+        away_players = sorted({c[:-2] for c in self.tracking.columns if re.match(r"away_\d+_x", c)})
 
-        self.team1_cols = np.array([TraceHelper.player_to_cols(p) for p in self.team1_players]).flatten().tolist()
-        self.team2_cols = np.array([TraceHelper.player_to_cols(p) for p in self.team2_players]).flatten().tolist()
+        self.home_players = home_players
+        self.away_players = away_players
+        self.team_labels = ("home", "away")
+
+        self.home_cols = np.array([TraceHelper.player_to_cols(p) for p in self.home_players]).flatten().tolist()
+        self.away_cols = np.array([TraceHelper.player_to_cols(p) for p in self.away_players]).flatten().tolist()
 
         self.phase_records = None
+
+    @staticmethod
+    def get_team(player_id: str) -> str:
+        if isinstance(player_id, str) and (player_id.startswith("home_") or player_id.startswith("away_")):
+            return player_id.split("_", 1)[0]
+        else:
+            return np.nan
 
     @staticmethod
     def player_to_cols(p):
@@ -41,32 +54,33 @@ class TraceHelper:
         team = team_poss.iloc[0]
         nans = Counter(team_poss)[0] // 2
         team_poss.iloc[:-nans] = team
-        return team_poss.replace({0: np.nan, 1: "A", 2: "B"})
+        return team_poss.replace({0: np.nan, 1: "home", 2: "away"})
 
-    def find_gt_team_poss(self, player_poss_col="player_poss"):
-        self.traces["team_poss"] = self.traces[player_poss_col].fillna(method="bfill").fillna(method="ffill")
-        self.traces["team_poss"] = self.traces["team_poss"].apply(lambda x: x[0])
+    # def label_team_poss(self, player_poss_col="player_id"):
+    #     self.tracking["team_poss"] = self.tracking[player_poss_col].fillna(method="bfill").fillna(method="ffill")
+    #     self.tracking["team_poss"] = self.tracking["team_poss"].apply(TraceHelper.get_team)
 
-        # team_poss_dict = {"T": np.nan, "O": 0, "A": 1, "B": 2}
-        # team_poss = self.traces[player_poss_col].fillna("T").apply(lambda x: x[0]).map(team_poss_dict)
-        # poss_ids = (team_poss.diff().fillna(0) * team_poss).cumsum()
-        # team_poss = team_poss.groupby(poss_ids, group_keys=True).apply(TraceHelper.ffill_transition)
-        # team_poss = team_poss.reset_index(level=0, drop=True)
-        # self.traces["team_poss"] = team_poss.fillna(method="bfill").fillna(method="ffill")
+    # team_poss_dict = {"T": np.nan, "O": 0, "home": 1, "away": 2}
+    # team_poss = self.tracking[player_poss_col].fillna("T").apply(lambda x: x[0]).map(team_poss_dict)
+    # poss_ids = (team_poss.diff().fillna(0) * team_poss).cumsum()
+    # team_poss = team_poss.groupby(poss_ids, group_keys=True).apply(TraceHelper.ffill_transition)
+    # team_poss = team_poss.reset_index(level=0, drop=True)
+    # self.tracking["team_poss"] = team_poss.fillna(method="bfill").fillna(method="ffill")
 
     def estimate_naive_team_poss(self):
-        xy_cols = [f"{p}{t}" for p in self.team1_players + self.team2_players for t in ["_x", "_y"]]
-        team_poss = pd.Series(index=self.traces.index, dtype=str)
+        xy_cols = [f"{p}{t}" for p in self.home_players + self.away_players for t in ["_x", "_y"]]
+        team_poss = pd.Series(index=self.tracking.index, dtype=str)
 
-        for phase in self.traces["phase"].unique():
+        for phase in self.tracking["phase"].unique():
             if isinstance(phase, str):  # For GPS-event traces, ignore phases with n_players < 22
                 phase_tuple = [int(i) for i in phase[1:-1].split(",")]
                 if phase_tuple[0] < 0 or phase_tuple[1] < 0:
                     continue
 
-            phase_traces = self.traces[self.traces["phase"] == phase]
+            phase_traces = self.tracking[self.tracking["phase"] == phase]
             phase_gks = SoccerDataset.detect_keepers(phase_traces)
-            team1_code, team2_code = phase_gks[0][0], phase_gks[1][0]
+            team1_code = TraceHelper.get_team(phase_gks[0])
+            team2_code = TraceHelper.get_team(phase_gks[1])
 
             ball_in_left = phase_traces[xy_cols].mean(axis=1) < self.pitch_size[0] / 2
             team_poss.loc[phase_traces.index] = np.where(ball_in_left, team1_code, team2_code)
@@ -142,13 +156,13 @@ class TraceHelper:
         n_features = model.x_dim if target_type == "player_poss" else model.params["n_features"]
         n_input_players = 10 if target_type == "gk" else 11
         feature_types = TraceHelper.player_to_cols("")[:n_features]
-        player_cols = [f"{p}{t}" for p in self.team1_players + self.team2_players for t in feature_types]
+        player_cols = [f"{p}{t}" for p in self.home_players + self.away_players for t in feature_types]
 
         if macro_type is None:
             macro_pred_df = None
         elif macro_type == "team_poss":
-            macro_cols = ["A", "B"]
-            macro_pred_df = pd.DataFrame(index=self.traces.index, columns=macro_cols, dtype=float)
+            macro_cols = list(self.team_labels)
+            macro_pred_df = pd.DataFrame(index=self.tracking.index, columns=macro_cols, dtype=float)
 
         if macro_type == "player_poss" or target_type == "player_poss":
             outside_labels = ["out_left", "out_right", "out_bottom", "out_top"]
@@ -156,25 +170,25 @@ class TraceHelper:
             outside_y = [self.pitch_size[1] / 2, self.pitch_size[1] / 2, 0, self.pitch_size[1]]
 
             for i, label in enumerate(outside_labels):
-                self.traces[f"{label}_x"] = float(outside_x[i])
-                self.traces[f"{label}_y"] = float(outside_y[i])
-                self.traces[[f"{label}_vx", f"{label}_vy", f"{label}_speed", f"{label}_accel"]] = 0
+                self.tracking[f"{label}_x"] = float(outside_x[i])
+                self.tracking[f"{label}_y"] = float(outside_y[i])
+                self.tracking[[f"{label}_vx", f"{label}_vy", f"{label}_speed", f"{label}_accel"]] = 0
 
-            poss_labels = self.team1_players + self.team2_players + outside_labels
+            poss_labels = self.home_players + self.away_players + outside_labels
             player_cols = [f"{p}{t}" for p in poss_labels for t in feature_types]
 
             if macro_type == "player_poss":
                 macro_cols = poss_labels
-                macro_pred_df = pd.DataFrame(index=self.traces.index, columns=poss_labels, dtype=float)
+                macro_pred_df = pd.DataFrame(index=self.tracking.index, columns=poss_labels, dtype=float)
                 if masking_prob < 1:
-                    self.traces["masked_poss"] = np.nan
+                    self.tracking["masked_poss"] = np.nan
             else:  # micro_type == "player_poss"
-                micro_pred_df = pd.DataFrame(index=self.traces.index, columns=poss_labels, dtype=float)
+                micro_pred_df = pd.DataFrame(index=self.tracking.index, columns=poss_labels, dtype=float)
 
         if target_type == "gk":
             gks = []
-            for phase in self.traces["phase"].unique():
-                phase_traces = self.traces[self.traces["phase"] == phase]
+            for phase in self.tracking["phase"].unique():
+                phase_traces = self.tracking[self.tracking["phase"] == phase]
                 phase_gks = SoccerDataset.detect_keepers(phase_traces)
                 for gk in phase_gks:
                     if gk not in gks:
@@ -182,16 +196,16 @@ class TraceHelper:
 
             gks.sort()
             pred_cols = [f"{p}{t}" for p in gks for t in feature_types[:2]]
-            micro_pred_df = pd.DataFrame(index=self.traces.index, columns=pred_cols, dtype=float)
+            micro_pred_df = pd.DataFrame(index=self.tracking.index, columns=pred_cols, dtype=float)
 
         elif target_type == "ball":
-            micro_pred_df = pd.DataFrame(index=self.traces.index, columns=["ball_x", "ball_y"], dtype=float)
+            micro_pred_df = pd.DataFrame(index=self.tracking.index, columns=["ball_x", "ball_y"], dtype=float)
             if masking_prob < 1:
-                self.traces["masked_ball_x"] = np.nan
-                self.traces["masked_ball_y"] = np.nan
+                self.tracking["masked_ball_x"] = np.nan
+                self.tracking["masked_ball_y"] = np.nan
 
         elif target_type == "transition":
-            micro_pred_df = pd.DataFrame(index=self.traces.index, columns=["transition"], dtype=float)
+            micro_pred_df = pd.DataFrame(index=self.tracking.index, columns=["transition"], dtype=float)
 
         n_frames = 0
         if evaluate:
@@ -200,16 +214,17 @@ class TraceHelper:
             sum_pos_error = 0
             sum_real_loss = 0
 
-        for phase in self.traces["phase"].unique():
+        for phase in self.tracking["phase"].unique():
             if isinstance(phase, str):  # For GPS-event traces, ignore phases with n_players < 22
                 phase_tuple = [int(i) for i in phase[1:-1].split(",")]
                 if phase_tuple[0] < 0 or phase_tuple[1] < 0:
                     continue
 
-            phase_traces = self.traces[self.traces["phase"] == phase]
+            phase_traces = self.tracking[self.tracking["phase"] == phase]
             phase_player_cols = phase_traces[player_cols].dropna(axis=1, how="all").columns
             phase_gks = SoccerDataset.detect_keepers(phase_traces)
-            team1_code, team2_code = phase_gks[0][0], phase_gks[1][0]
+            team1_code = TraceHelper.get_team(phase_gks[0])
+            team2_code = TraceHelper.get_team(phase_gks[1])
 
             if target_type == "gk":
                 input_cols = [c for c in phase_player_cols if c[:3] not in phase_gks]
@@ -267,9 +282,9 @@ class TraceHelper:
 
                 if macro_type == "player_poss" and target_type == "ball" and masking_prob < 1:
                     random_mask_np = random_mask.numpy()[0, :, 0]
-                    self.traces.loc[ep_traces.index, "masked_poss"] = player_poss.where(random_mask_np)
-                    self.traces.loc[ep_traces.index, "masked_ball_x"] = ep_traces["ball_x"].where(random_mask_np)
-                    self.traces.loc[ep_traces.index, "masked_ball_y"] = ep_traces["ball_y"].where(random_mask_np)
+                    self.tracking.loc[ep_traces.index, "masked_poss"] = player_poss.where(random_mask_np)
+                    self.tracking.loc[ep_traces.index, "masked_ball_x"] = ep_traces["ball_x"].where(random_mask_np)
+                    self.tracking.loc[ep_traces.index, "masked_ball_y"] = ep_traces["ball_y"].where(random_mask_np)
 
                 with torch.no_grad():
                     try:
@@ -307,7 +322,7 @@ class TraceHelper:
 
                     elif macro_type == "player_poss":
                         team_poss_pred = np.argmax(macro_pred.numpy(), axis=1) // 11
-                        team_poss_target = player_poss.apply(lambda x: x[0]).map(team_poss_dict)
+                        team_poss_target = player_poss.apply(TraceHelper.get_team).map(team_poss_dict)
                         correct_team_poss += (team_poss_pred == team_poss_target).sum()
                         correct_player_poss += calc_class_acc(macro_pred, macro_target, aggfunc="sum")
 
@@ -316,7 +331,7 @@ class TraceHelper:
 
                     if target_type == "player_poss":
                         team_poss_pred = np.argmax(micro_pred.numpy(), axis=1) // 11
-                        team_poss_target = player_poss.apply(lambda x: x[0]).map(team_poss_dict)
+                        team_poss_target = player_poss.apply(TraceHelper.get_team).map(team_poss_dict)
                         correct_team_poss += (team_poss_pred == team_poss_target).sum()
                         correct_player_poss += calc_class_acc(micro_pred, micro_target, aggfunc="sum")
 
@@ -342,11 +357,11 @@ class TraceHelper:
         if macro_type is not None:
             argmax_idxs = np.argpartition(-macro_pred_df.values, range(3), axis=1)[:, :3]
             player_poss_top3 = pd.DataFrame(np.array(macro_pred_df.columns)[argmax_idxs])
-            self.traces["pred_poss"] = macro_pred_df.idxmax(axis=1)
-            self.traces["pred_poss_top3"] = player_poss_top3.apply(lambda x: x.tolist(), axis=1)
+            self.tracking["pred_poss"] = macro_pred_df.idxmax(axis=1)
+            self.tracking["pred_poss_top3"] = player_poss_top3.apply(lambda x: x.tolist(), axis=1)
 
-        self.traces["pred_ball_x"] = micro_pred_df["ball_x"]
-        self.traces["pred_ball_y"] = micro_pred_df["ball_y"]
+        self.tracking["pred_ball_x"] = micro_pred_df["ball_x"]
+        self.tracking["pred_ball_y"] = micro_pred_df["ball_y"]
 
         stats = {"n_frames": n_frames}
         if n_frames == 0:
@@ -394,7 +409,8 @@ class TraceHelper:
         fig.set_size_inches(15, 10)
         plt.rcParams.update({"font.size": 15})
 
-        times = traces["time"].values
+        time_col = "timestamp" if "timestamp" in traces.columns else "time"
+        times = traces[time_col].values
         t0 = int(times[0] - 0.1)
 
         axes[0].set(xlim=(t0, t0 + FRAME_DUR), ylim=(0, MAX_SPEED))
