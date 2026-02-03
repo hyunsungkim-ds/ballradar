@@ -287,7 +287,7 @@ class MetricaData:
     def label_episodes(
         events: pd.DataFrame,
         tracking: pd.DataFrame,
-        margin_sec: float = 2,
+        margin_sec: float = 1,
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         events = events.copy()
         tracking = tracking.copy()
@@ -310,16 +310,48 @@ class MetricaData:
             last_event_times = grouped.max()
 
             for episode in first_event_times.index:
-                first_time = first_event_times.loc[episode] - margin_sec
-                last_time = last_event_times.loc[episode] + margin_sec
+                first_time = round(first_event_times.loc[episode] - margin_sec, 2)
+                last_time = round(last_event_times.loc[episode] + margin_sec, 2)
                 episode_idxs = phase_tracking[phase_tracking["timestamp"].between(first_time, last_time)].index
                 tracking.loc[episode_idxs, "episode_id"] = episode
 
         tracking["ball_state"] = np.where(tracking["episode_id"] > 0, "alive", "dead")
         return events, tracking
 
+    def merge_for_animation(events: pd.DataFrame, tracking: pd.DataFrame) -> pd.DataFrame:
+        tracking = tracking.copy()
+        events = events[["start_frame", "from", "type"]].copy()
+        events.columns = ["frame_id", "player_id", "event_type"]
+        merged = pd.merge(tracking.drop("player_id", axis=1), events, how="left")
+
+        merged["event_x"] = np.nan
+        merged["event_y"] = np.nan
+
+        mask = merged["event_type"].notna()
+        rows = np.flatnonzero(mask)
+
+        player_ids = merged.loc[mask, "player_id"].astype(str)
+        x_cols = (player_ids + "_x").to_numpy()
+        y_cols = (player_ids + "_y").to_numpy()
+        col_idx_x = merged.columns.get_indexer(x_cols)
+        col_idx_y = merged.columns.get_indexer(y_cols)
+
+        merged.loc[mask, "event_x"] = merged.to_numpy()[rows, col_idx_x].astype(float)
+        merged.loc[mask, "event_y"] = merged.to_numpy()[rows, col_idx_y].astype(float)
+
+        merged["player_id"] = merged["player_id"].ffill()
+        merged["event_type"] = merged["event_type"].ffill()
+        merged["event_x"] = merged["event_x"].ffill().bfill()
+        merged["event_y"] = merged["event_y"].ffill().bfill()
+
+        return merged
+
     @staticmethod
-    def label_possessions(events: pd.DataFrame, tracking: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    def label_possessions(
+        events: pd.DataFrame,
+        tracking: pd.DataFrame,
+        out_gap_frames: int = 50,
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         events = events.copy()
         tracking = tracking.copy()
 
@@ -370,17 +402,18 @@ class MetricaData:
                 if i == events.index[-1]:
                     tracking.loc[out_frame:, "player_id"] = out_label
                 else:
-                    i_next = events[events["start_frame"] > out_frame + 50].index[0]
+                    i_next = events[events["start_frame"] > out_frame + out_gap_frames].index[0]
                     next_frame = events.at[i_next, "start_frame"]
-                    tracking.loc[out_frame : next_frame - 51, "player_id"] = out_label
-                    tracking.loc[next_frame - 50 : next_frame, "player_id"] = events.at[i_next, "from"]
+                    tracking.loc[out_frame : next_frame - (out_gap_frames + 1), "player_id"] = out_label
+                    tracking.loc[next_frame - out_gap_frames : next_frame, "player_id"] = events.at[i_next, "from"]
 
         poss_prev = tracking["player_id"].ffill()
         poss_next = tracking["player_id"].bfill()
         tracking["player_id"] = poss_prev.where(poss_prev == poss_next, np.nan)
         tracking["ball_owning_team_id"] = tracking["player_id"].apply(MetricaData._get_team).bfill().ffill()
 
-        return events, tracking
+        tracking_cols = config.TRACKING_COLS + [c for c in tracking.columns if c not in config.TRACKING_COLS]
+        return events[config.EVENT_COLS], tracking[tracking_cols].reset_index()
 
     @staticmethod
     def find_nearest_player(snapshot, players, team_code=None):
@@ -445,13 +478,11 @@ class MetricaData:
                         )
                         switch_counts.at[recorded_p_to, detected_p_to] += 1
 
-            switch_dict = switch_counts[switch_counts.sum(axis=1) > 0].idxmax(axis=1).to_dict()
-            self.events.loc[phase_events.index, "from"] = phase_events["from"].replace(switch_dict)
-            self.events.loc[phase_events.index, "to"] = phase_events["to"].replace(switch_dict)
-            self.tracking.loc[phase_tracking.index, "event_player"] = phase_tracking["event_player"].replace(
-                switch_dict
-            )
-            self.tracking.loc[phase_tracking.index, "player_id"] = phase_tracking["player_id"].replace(switch_dict)
+            mapping = switch_counts[switch_counts.sum(axis=1) > 0].idxmax(axis=1).to_dict()
+            self.events.loc[phase_events.index, "from"] = phase_events["from"].replace(mapping)
+            self.events.loc[phase_events.index, "to"] = phase_events["to"].replace(mapping)
+            self.tracking.loc[phase_tracking.index, "event_player"] = phase_tracking["event_player"].replace(mapping)
+            self.tracking.loc[phase_tracking.index, "player_id"] = phase_tracking["player_id"].replace(mapping)
 
     def construct_pass_records(self, frames: pd.Series = None):
         events = self.events[self.events["start_frame"].isin(frames)] if frames is not None else self.events
