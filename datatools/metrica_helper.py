@@ -1,8 +1,6 @@
-import math
 import os
 import re
 import sys
-from datetime import timedelta
 from typing import Optional, Tuple
 
 if not os.getcwd() in sys.path:
@@ -13,53 +11,44 @@ import pandas as pd
 from tqdm import tqdm
 
 from datatools import config
-from datatools.trace_helper import TraceHelper
 
 
-class MetricaHelper(TraceHelper):
+class MetricaHelper:
     def __init__(
         self,
         home_tracking: pd.DataFrame = None,
         away_tracking: pd.DataFrame = None,
         tracking_from_txt: pd.DataFrame = None,
-        tracking_processed: pd.DataFrame = None,
         events: pd.DataFrame = None,
     ):
         events = events.copy()
 
-        if tracking_processed is not None:
-            tracking = MetricaHelper.format_tracking(tracking_processed)
-            if "frame_id" in tracking.columns:
-                tracking.index.name = "frame_id"
-                tracking.reset_index(inplace=True)
-            frames_to_episodes = tracking[["frame_id", "episode_id"]].rename(columns={"frame_id": "start_frame"})
-            events = MetricaHelper.format_events(events)
-            if events is not None:
-                events = pd.merge(events, frames_to_episodes)
-
+        if home_tracking is not None:
+            assert away_tracking is not None and tracking_from_txt is None
+            home_tracking = home_tracking.copy()
+            away_tracking = away_tracking.copy()
+            tracking = MetricaHelper._parse_tracking_from_csv(home_tracking, away_tracking)
         else:
-            if home_tracking is not None:
-                assert away_tracking is not None and tracking_from_txt is None
-                home_tracking = home_tracking.copy()
-                away_tracking = away_tracking.copy()
-                tracking = MetricaHelper.parse_tracking_from_csv(home_tracking, away_tracking)
-            else:
-                assert away_tracking is None and tracking_from_txt is not None
-                tracking = tracking_from_txt.copy()
+            assert away_tracking is None and tracking_from_txt is not None
+            tracking = tracking_from_txt.copy()
 
-            tracking = MetricaHelper.format_tracking(tracking)
+        tracking = MetricaHelper.format_tracking(tracking).dropna(axis=1, how="all")
+        x_cols = [c for c in tracking.columns if c.endswith("_x")]
+        y_cols = [c for c in tracking.columns if c.endswith("_y")]
+        tracking[x_cols] *= config.PITCH_X
+        tracking[y_cols] *= config.PITCH_Y
 
-            x_cols = [c for c in tracking.columns if c.endswith("_x")]
-            y_cols = [c for c in tracking.columns if c.endswith("_y")]
-            tracking[x_cols] *= config.PITCH_X
-            tracking[y_cols] *= config.PITCH_Y
+        players = [c[:-2] for c in tracking.columns if c.endswith("_x") and not c.startswith("ball")]
+        events = MetricaHelper.format_events(events, players)
 
-            players = [c[:-2] for c in tracking.columns if c.endswith("_x") and not c.startswith("ball")]
-            events = MetricaHelper.parse_events(events, players)
+        self.tracking, self.events = MetricaHelper._rebase_tracking_times(tracking, events)
 
-        tracking, events = MetricaHelper._rebase_tracking_times(tracking, events)
-
-        super().__init__(tracking, events)
+    @staticmethod
+    def _get_team(player_id: str) -> str:
+        if isinstance(player_id, str) and (player_id.startswith("home_") or player_id.startswith("away_")):
+            return player_id.split("_", 1)[0]
+        else:
+            return np.nan
 
     @staticmethod
     def _parse_player_id(player_id: str, team: Optional[str] = None) -> str:
@@ -78,7 +67,7 @@ class MetricaHelper(TraceHelper):
         return player_id
 
     @staticmethod
-    def parse_tracking_from_csv(home_tracking: pd.DataFrame, away_tracking: pd.DataFrame) -> pd.DataFrame:
+    def _parse_tracking_from_csv(home_tracking: pd.DataFrame, away_tracking: pd.DataFrame) -> pd.DataFrame:
         home_players = [f"home_{int(c[2][6:])}" for c in home_tracking.columns[3:-2:2]]
         home_xy_cols = np.array([[f"{p}_x", f"{p}_y"] for p in home_players]).flatten().tolist()
         home_tracking.columns = ["period_id", "frame_id", "timestamp"] + home_xy_cols + ["ball_x", "ball_y"]
@@ -98,7 +87,7 @@ class MetricaHelper(TraceHelper):
         return tracking
 
     @staticmethod
-    def parse_events(events: pd.DataFrame, players: list) -> pd.DataFrame:
+    def format_events(events: pd.DataFrame, players: list) -> pd.DataFrame:
         events.columns = [
             "team",
             "type",
@@ -178,20 +167,6 @@ class MetricaHelper(TraceHelper):
         elif tracking.index.name is None and "frame_id" not in tracking.columns:
             tracking.index.name = "frame_id"
         return tracking
-
-    @staticmethod
-    def format_events(events: pd.DataFrame) -> pd.DataFrame:
-        if events is None:
-            return None
-        events = events.copy()
-        if "session" in events.columns and "period_id" not in events.columns:
-            events = events.rename(columns={"session": "period_id"})
-        if "team" in events.columns:
-            events["team"] = events["team"].str.lower()
-        for col in ["from", "to"]:
-            if col in events.columns:
-                events[col] = events[col].apply(MetricaHelper._parse_player_id)
-        return events
 
     @staticmethod
     def _rebase_tracking_times(
@@ -402,101 +377,16 @@ class MetricaHelper(TraceHelper):
         poss_prev = tracking["player_id"].ffill()
         poss_next = tracking["player_id"].bfill()
         tracking["player_id"] = poss_prev.where(poss_prev == poss_next, np.nan)
-        tracking["ball_owning_team_id"] = tracking["player_id"].apply(TraceHelper.get_team).bfill().ffill()
+        tracking["ball_owning_team_id"] = tracking["player_id"].apply(MetricaHelper._get_team).bfill().ffill()
 
         return tracking
-
-    def downsample_to_10fps(self, phase_records: pd.DataFrame):
-        if "phase_id" not in self.tracking.columns:
-            raise ValueError("phase_id column missing. Call apply_phase_records(phase_records) first.")
-        upsample_idxs = pd.date_range("2020-01-01 00:00:00.02", periods=len(self.tracking) * 2, freq="0.02S")
-        xy_cols = [c for c in self.tracking.columns if c.endswith("_x") or c.endswith("_y")]
-        traces_50fps = pd.DataFrame(index=upsample_idxs, columns=["period_id", "phase_id"] + xy_cols, dtype="float")
-        traces_50fps.index.name = "datetime"
-
-        traces_50fps.loc[traces_50fps.index[1::2]] = self.tracking[["period_id", "phase_id"] + xy_cols].values
-
-        traces_50fps[["period_id", "phase_id"]] = (
-            traces_50fps[["period_id", "phase_id"]].fillna(method="bfill").astype(int)
-        )
-        traces_50fps = traces_50fps.groupby("period_id", group_keys=False).apply(
-            lambda x: x.interpolate(limit_area="inside")
-        )
-        traces_50fps = traces_50fps[traces_50fps["phase_id"] > 0]
-
-        traces_10fps_list = []
-        start_dt = pd.to_datetime("2020-01-01 00:00:00")
-
-        for period_id in traces_50fps["period_id"].unique():
-            period_traces_50fps = traces_50fps[traces_50fps["period_id"] == period_id]
-            period_traces_10fps = period_traces_50fps.resample("0.1S", closed="right", label="right").mean()
-
-            period_phase_records = phase_records[phase_records["period_id"] == period_id]
-            period_start_dt = start_dt + timedelta(seconds=period_phase_records["start_time"].iloc[0])
-            period_end_dt = start_dt + timedelta(seconds=period_phase_records["end_time"].iloc[-1])
-            traces_10fps_list.append(period_traces_10fps.loc[period_start_dt:period_end_dt])
-
-        traces_10fps = pd.concat(traces_10fps_list).reset_index()
-        assert isinstance(traces_10fps, pd.DataFrame)
-
-        traces_10fps[["period_id", "phase_id"]] = traces_10fps[["period_id", "phase_id"]].astype(int)
-        traces_10fps["timestamp"] = (np.arange(len(traces_10fps)) * 0.1 + 0.1).round(1)
-        traces_10fps = traces_10fps.set_index("timestamp")
-
-        for i in tqdm(self.events.index, desc="Combining tracking and event data"):
-            t0 = self.events.at[i, "start_time"]
-            t1 = self.events.at[i, "end_time"]
-            traces_10fps.loc[t0:t1, "event_player"] = self.events.at[i, "from"]
-            traces_10fps.loc[t0:t1, "event_type"] = self.events.at[i, "subtype"]
-
-        for phase in phase_records.index:
-            t0 = phase_records.at[phase, "start_time"]
-            t1 = phase_records.at[phase, "end_time"]
-            traces_10fps.loc[t0:t1, "phase_id"] = phase
-
-            valid_players = phase_records.at[phase, "player_ids"]
-            valid_cols = np.array([[f"{p}_x", f"{p}_y"] for p in valid_players]).flatten().tolist()
-            invalid_players = list(set(self.home_players + self.away_players) - set(valid_players))
-            invalid_cols = np.array([[f"{p}_x", f"{p}_y"] for p in invalid_players]).flatten().tolist()
-
-            traces_10fps.loc[t0:t1, invalid_cols] = np.nan
-            traces_10fps_interp = traces_10fps.loc[t0:t1, valid_cols].interpolate(limit_direction="both")
-            traces_10fps.loc[t0:t1, valid_cols] = traces_10fps_interp
-
-        traces_10fps["frame_id"] = np.arange(len(traces_10fps)) + 1
-        traces_10fps["episode_id"] = 0
-        traces_10fps["team_poss"] = np.nan
-        traces_10fps["player_id"] = np.nan
-        traces_10fps[["ball_x", "ball_y"]] = (
-            traces_10fps[["period_id", "ball_x", "ball_y"]]
-            .groupby("period_id", group_keys=False)
-            .apply(lambda x: x.interpolate(limit_direction="both"))[["ball_x", "ball_y"]]
-        )
-
-        meta_cols = [
-            "frame_id",
-            "period_id",
-            "timestamp",
-            "phase_id",
-            "episode_id",
-            "team_poss",
-            "player_id",
-            "event_player",
-            "event_type",
-        ]
-        self.tracking = traces_10fps.reset_index()[meta_cols + xy_cols]
-
-        self.events["start_frame"] = (self.events["start_time"] * 10).astype(int)
-        self.events["end_frame"] = (self.events["end_time"] * 10).astype(int)
-        phase_times = self.tracking[["timestamp", "phase_id"]].rename(columns={"timestamp": "start_time"})
-        self.events = pd.merge(self.events, phase_times)
 
     @staticmethod
     def find_nearest_player(snapshot, players, team_code=None):
         if team_code is None:
             team_players = players
         else:
-            team_players = [p for p in players if TraceHelper.get_team(p) == team_code]
+            team_players = [p for p in players if MetricaHelper._get_team(p) == team_code]
             if not team_players:
                 team_players = players
 
@@ -536,7 +426,7 @@ class MetricaHelper(TraceHelper):
                     end_frame = phase_events.at[i, "end_frame"]
 
                     recorded_p_from = phase_events.at[i, "from"]
-                    recorded_team = TraceHelper.get_team(recorded_p_from)
+                    recorded_team = MetricaHelper._get_team(recorded_p_from)
                     if pd.isna(recorded_team):
                         recorded_team = None
                     detected_p_from = MetricaHelper.find_nearest_player(
@@ -546,7 +436,7 @@ class MetricaHelper(TraceHelper):
 
                     if event_type == "PASS":
                         recorded_p_to = phase_events.at[i, "to"]
-                        recorded_team = TraceHelper.get_team(recorded_p_to)
+                        recorded_team = MetricaHelper._get_team(recorded_p_to)
                         if pd.isna(recorded_team):
                             recorded_team = None
                         detected_p_to = MetricaHelper.find_nearest_player(
