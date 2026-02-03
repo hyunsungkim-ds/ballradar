@@ -13,7 +13,7 @@ from tqdm import tqdm
 from datatools import config
 
 
-class MetricaHelper:
+class MetricaData:
     def __init__(
         self,
         home_tracking: pd.DataFrame = None,
@@ -27,21 +27,21 @@ class MetricaHelper:
             assert away_tracking is not None and tracking_from_txt is None
             home_tracking = home_tracking.copy()
             away_tracking = away_tracking.copy()
-            tracking = MetricaHelper._parse_tracking_from_csv(home_tracking, away_tracking)
+            tracking = MetricaData._parse_tracking_from_csv(home_tracking, away_tracking)
         else:
             assert away_tracking is None and tracking_from_txt is not None
             tracking = tracking_from_txt.copy()
 
-        tracking = MetricaHelper.format_tracking(tracking).dropna(axis=1, how="all")
+        tracking = MetricaData.format_tracking(tracking).dropna(axis=1, how="all")
         x_cols = [c for c in tracking.columns if c.endswith("_x")]
         y_cols = [c for c in tracking.columns if c.endswith("_y")]
         tracking[x_cols] *= config.PITCH_X
         tracking[y_cols] *= config.PITCH_Y
 
         players = [c[:-2] for c in tracking.columns if c.endswith("_x") and not c.startswith("ball")]
-        events = MetricaHelper.format_events(events, players)
+        events = MetricaData.format_events(events, players)
 
-        self.tracking, self.events = MetricaHelper._rebase_tracking_times(tracking, events)
+        self.tracking, self.events = MetricaData._rebase_timestamps(tracking, events)
 
     @staticmethod
     def _get_team(player_id: str) -> str:
@@ -122,7 +122,7 @@ class MetricaHelper:
         def map_player_id(player_id, team):
             if pd.isna(player_id):
                 return np.nan
-            mapped = MetricaHelper._parse_player_id(player_id, team=team)
+            mapped = MetricaData._parse_player_id(player_id, team=team)
             if mapped != player_id:
                 return mapped
             return player_dict.get(player_id, player_id)
@@ -158,7 +158,7 @@ class MetricaHelper:
 
         for col in ["player_id", "event_player"]:
             if col in tracking.columns:
-                tracking[col] = tracking[col].apply(MetricaHelper._parse_player_id)
+                tracking[col] = tracking[col].apply(MetricaData._parse_player_id)
         if "team_poss" in tracking.columns:
             tracking["team_poss"] = tracking["team_poss"].replace({"A": "home", "B": "away"})
 
@@ -169,7 +169,7 @@ class MetricaHelper:
         return tracking
 
     @staticmethod
-    def _rebase_tracking_times(
+    def _rebase_timestamps(
         tracking: pd.DataFrame,
         events: pd.DataFrame = None,
         frame_dt: float = 0.04,
@@ -221,7 +221,7 @@ class MetricaHelper:
         return tracking, events
 
     @staticmethod
-    def generate_phase_records(tracking: pd.DataFrame) -> pd.DataFrame:
+    def construct_phase_records(tracking: pd.DataFrame) -> pd.DataFrame:
         home_players = sorted({c[:-2] for c in tracking.columns if re.match(r"home_\d+_x", c)})
         away_players = sorted({c[:-2] for c in tracking.columns if re.match(r"away_\d+_x", c)})
         player_x_cols = [f"{p}_x" for p in home_players + away_players]
@@ -269,7 +269,7 @@ class MetricaHelper:
         events["phase_id"] = 0
         tracking["phase_id"] = 0
 
-        phase_records = MetricaHelper.generate_phase_records(tracking)
+        phase_records = MetricaData.construct_phase_records(tracking)
 
         for phase_id, row in phase_records.iterrows():
             period_id = row["period_id"]
@@ -319,41 +319,42 @@ class MetricaHelper:
         return events, tracking
 
     @staticmethod
-    def label_poss(events: pd.DataFrame, tracking: pd.DataFrame) -> pd.DataFrame:
+    def label_possessions(events: pd.DataFrame, tracking: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        events = events.copy()
         tracking = tracking.copy()
 
         tracking["player_id"] = pd.Series(np.nan, index=tracking.index, dtype="object")
         if "frame_id" in tracking.columns:
             tracking.set_index("frame_id", inplace=True)
 
-        filtered_events = events[
+        events = events[
             ~(events["type"].isin(["CARRY", "CARD", "SET PIECE"]))
             & ~((events["type"] == "BALL LOST") & (events["subtype"] == "THEFT"))
             & ~((events["type"] == "CHALLENGE") & (events["subtype"].str.endswith("-LOST")))
         ].copy()
 
         type_order = ["BALL LOST", "CHALLENGE", "RECOVERY", "FAULT RECEIVED", "PASS", "SHOT", "BALL OUT"]
-        filtered_events["type"] = pd.Categorical(filtered_events["type"], categories=type_order)
-        filtered_events.sort_values(["start_time", "type"], inplace=True)
+        events["type"] = pd.Categorical(events["type"], categories=type_order)
+        events.sort_values(["start_frame", "end_frame", "type"], inplace=True)
 
         out_frame = 0
 
-        for i in filtered_events.index:
-            event_type = filtered_events.at[i, "type"]
-            event_subtype = filtered_events.at[i, "subtype"]
-            start_frame = int(filtered_events.at[i, "start_frame"])
-            end_frame = int(filtered_events.at[i, "end_frame"])
+        for i in events.index:
+            event_type = events.at[i, "type"]
+            event_subtype = events.at[i, "subtype"]
+            start_frame = int(events.at[i, "start_frame"])
+            end_frame = int(events.at[i, "end_frame"])
 
             if start_frame in tracking.index:
-                tracking.at[start_frame, "player_id"] = filtered_events.at[i, "from"]
+                tracking.at[start_frame, "player_id"] = events.at[i, "from"]
 
-            to_player = filtered_events.at[i, "to"]
+            to_player = events.at[i, "to"]
             if pd.notna(to_player) and end_frame in tracking.index:
                 tracking.at[end_frame, "player_id"] = to_player
 
             if event_type == "BALL OUT" or event_subtype.endswith("-OUT") or event_subtype.endswith("-GOAL"):
-                out_x = filtered_events.at[i, "end_x"]
-                out_y = filtered_events.at[i, "end_y"]
+                out_x = events.at[i, "end_x"]
+                out_y = events.at[i, "end_y"]
                 if out_x < 0:
                     out_label = "goal_left" if event_subtype.endswith("-GOAL") else "out_left"
                 elif out_x > 1:
@@ -366,27 +367,27 @@ class MetricaHelper:
                     continue
 
                 out_frame = end_frame
-                if i == filtered_events.index[-1]:
+                if i == events.index[-1]:
                     tracking.loc[out_frame:, "player_id"] = out_label
                 else:
-                    i_next = filtered_events[filtered_events["start_frame"] > out_frame + 50].index[0]
-                    next_frame = filtered_events.at[i_next, "start_frame"]
+                    i_next = events[events["start_frame"] > out_frame + 50].index[0]
+                    next_frame = events.at[i_next, "start_frame"]
                     tracking.loc[out_frame : next_frame - 51, "player_id"] = out_label
-                    tracking.loc[next_frame - 50 : next_frame, "player_id"] = filtered_events.at[i_next, "from"]
+                    tracking.loc[next_frame - 50 : next_frame, "player_id"] = events.at[i_next, "from"]
 
         poss_prev = tracking["player_id"].ffill()
         poss_next = tracking["player_id"].bfill()
         tracking["player_id"] = poss_prev.where(poss_prev == poss_next, np.nan)
-        tracking["ball_owning_team_id"] = tracking["player_id"].apply(MetricaHelper._get_team).bfill().ffill()
+        tracking["ball_owning_team_id"] = tracking["player_id"].apply(MetricaData._get_team).bfill().ffill()
 
-        return tracking
+        return events, tracking
 
     @staticmethod
     def find_nearest_player(snapshot, players, team_code=None):
         if team_code is None:
             team_players = players
         else:
-            team_players = [p for p in players if MetricaHelper._get_team(p) == team_code]
+            team_players = [p for p in players if MetricaData._get_team(p) == team_code]
             if not team_players:
                 team_players = players
 
@@ -426,20 +427,20 @@ class MetricaHelper:
                     end_frame = phase_events.at[i, "end_frame"]
 
                     recorded_p_from = phase_events.at[i, "from"]
-                    recorded_team = MetricaHelper._get_team(recorded_p_from)
+                    recorded_team = MetricaData._get_team(recorded_p_from)
                     if pd.isna(recorded_team):
                         recorded_team = None
-                    detected_p_from = MetricaHelper.find_nearest_player(
+                    detected_p_from = MetricaData.find_nearest_player(
                         phase_tracking.loc[start_frame - 1], phase_players, recorded_team
                     )
                     switch_counts.at[recorded_p_from, detected_p_from] += 1
 
                     if event_type == "PASS":
                         recorded_p_to = phase_events.at[i, "to"]
-                        recorded_team = MetricaHelper._get_team(recorded_p_to)
+                        recorded_team = MetricaData._get_team(recorded_p_to)
                         if pd.isna(recorded_team):
                             recorded_team = None
-                        detected_p_to = MetricaHelper.find_nearest_player(
+                        detected_p_to = MetricaData.find_nearest_player(
                             phase_tracking.loc[end_frame - 1], phase_players, recorded_team
                         )
                         switch_counts.at[recorded_p_to, detected_p_to] += 1
@@ -452,7 +453,7 @@ class MetricaHelper:
             )
             self.tracking.loc[phase_tracking.index, "player_id"] = phase_tracking["player_id"].replace(switch_dict)
 
-    def generate_pass_records(self, frames: pd.Series = None):
+    def construct_pass_records(self, frames: pd.Series = None):
         events = self.events[self.events["start_frame"].isin(frames)] if frames is not None else self.events
 
         valid_types = ["BALL LOST", "RECOVERY", "PASS"]
@@ -491,19 +492,3 @@ class MetricaHelper:
 
         pass_cols = ["episode_id", "start_frame", "end_frame", "passer", "receiver", "success"]
         return pd.DataFrame(passes, columns=pass_cols)
-
-
-if __name__ == "__main__":
-    match_id = 3
-
-    trace_file = f"data/metrica_traces/Sample_Game_{match_id}/Sample_Game_{match_id}_RawTrackingData.csv"
-    events_file = f"data/metrica_traces/Sample_Game_{match_id}/Sample_Game_{match_id}_RawEventsData.csv"
-    traces = pd.read_csv(trace_file, index_col=0)
-    events = pd.read_csv(events_file, header=0)
-    helper = MetricaHelper(tracking_from_txt=traces, events=events)
-
-    helper.generate_phase_records()
-    helper.downsample_to_10fps()
-    # helper.split_into_episodes()
-    # helper.calculate_running_feaetures(smoothing=True)
-    helper.label_team_poss()
