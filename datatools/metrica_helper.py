@@ -25,18 +25,14 @@ class MetricaHelper(TraceHelper):
         tracking_processed: pd.DataFrame = None,
         events: pd.DataFrame = None,
     ):
-        home_tracking = home_tracking.copy()
-        away_tracking = away_tracking.copy()
         events = events.copy()
 
         if tracking_processed is not None:
             tracking = MetricaHelper.format_tracking(tracking_processed)
             if "frame_id" in tracking.columns:
-                frames_to_episodes = tracking[["frame_id", "episode_id"]].rename(columns={"frame_id": "start_frame"})
-            else:
-                frames_to_episodes = tracking.reset_index()[["frame_id", "episode_id"]].rename(
-                    columns={"frame_id": "start_frame"}
-                )
+                tracking.index.name = "frame_id"
+                tracking.reset_index(inplace=True)
+            frames_to_episodes = tracking[["frame_id", "episode_id"]].rename(columns={"frame_id": "start_frame"})
             events = MetricaHelper.format_events(events)
             if events is not None:
                 events = pd.merge(events, frames_to_episodes)
@@ -44,10 +40,12 @@ class MetricaHelper(TraceHelper):
         else:
             if home_tracking is not None:
                 assert away_tracking is not None and tracking_from_txt is None
+                home_tracking = home_tracking.copy()
+                away_tracking = away_tracking.copy()
                 tracking = MetricaHelper.parse_tracking_from_csv(home_tracking, away_tracking)
             else:
                 assert away_tracking is None and tracking_from_txt is not None
-                tracking = tracking_from_txt
+                tracking = tracking_from_txt.copy()
 
             tracking = MetricaHelper.format_tracking(tracking)
 
@@ -118,7 +116,7 @@ class MetricaHelper(TraceHelper):
             "end_y",
         ]
 
-        events["team"] = events["team"].str.lower()
+        events["team"] = events["team"].replace({"Team A": "Home", "Team B": "Away"}).str.lower()
         events.loc[events["subtype"].isna(), "subtype"] = events.loc[events["subtype"].isna(), "type"]
 
         player_numbers = []
@@ -143,7 +141,7 @@ class MetricaHelper(TraceHelper):
         events["from"] = events.apply(lambda row: map_player_id(row["from"], row["team"]), axis=1)
         events["to"] = events.apply(lambda row: map_player_id(row["to"], row["team"]), axis=1)
 
-        return events
+        return events.drop("team", axis=1)
 
     @staticmethod
     def format_tracking(tracking: pd.DataFrame) -> pd.DataFrame:
@@ -219,13 +217,14 @@ class MetricaHelper(TraceHelper):
         if "period_id" in tracking.columns and frame_id_series is not None:
             period_start_frames = frame_id_series.groupby(tracking["period_id"]).min().to_dict()
             period_offsets = tracking["period_id"].map(period_start_frames)
-            tracking["timestamp"] = ((frame_id_series - period_offsets) * frame_dt - frame_dt).clip(lower=0).round(2)
+            tracking["timestamp"] = ((frame_id_series - period_offsets) * frame_dt).round(2)
             recomputed_timestamp = True
 
         if not recomputed_timestamp and "timestamp" in tracking.columns:
             tracking["timestamp"] = (tracking["timestamp"] - frame_dt).clip(lower=0).round(2)
 
         if events is not None:
+            recomputed_event_times = False
             for col in ["start_frame", "end_frame"]:
                 if col in events.columns:
                     events[col] = pd.to_numeric(events[col], errors="coerce")
@@ -237,10 +236,12 @@ class MetricaHelper(TraceHelper):
                     events["start_time"] = ((events["start_frame"] - period_offsets) * frame_dt).round(2)
                 if "end_frame" in events.columns:
                     events["end_time"] = ((events["end_frame"] - period_offsets) * frame_dt).round(2)
+                recomputed_event_times = True
 
-            for col in ["start_time", "end_time"]:
-                if col in events.columns:
-                    events[col] = (events[col] - frame_dt).clip(lower=0).round(2)
+            if not recomputed_event_times:
+                for col in ["start_time", "end_time"]:
+                    if col in events.columns:
+                        events[col] = (events[col] - frame_dt).clip(lower=0).round(2)
 
         return tracking, events
 
@@ -287,7 +288,10 @@ class MetricaHelper(TraceHelper):
 
     @staticmethod
     def label_phases(events: pd.DataFrame, tracking: pd.DataFrame) -> pd.DataFrame:
+        events = events.copy()
         tracking = tracking.copy()
+
+        events["phase_id"] = 0
         tracking["phase_id"] = 0
 
         phase_records = MetricaHelper.generate_phase_records(tracking)
